@@ -2,7 +2,7 @@
 
 사용법 (프로젝트 폴더에서): python tools\\prepare_widerface.py <이니셜>
   이니셜: lyn(이유노, 폴더 0~20), cyj(조영준, 21~40), nyr(나예린, 41~61)
-결과: data\\processed\\widerface\\review\\<이니셜>\\train, val 에 박스를 그린 이미지 각 30장 (끝나면 폴더가 열림)
+결과: data\\processed\\widerface\\review\\<이니셜>\\train, val 에 맡은 범위의 모든 이미지를 박스를 그려 저장 (끝나면 폴더가 열림)
 
 - 받은 zip과 압축 푼 원본은 data\\raw\\widerface\\ 에 둔다 (git 제외). 이미 있으면 다시 받지 않는다.
 - 브라우저로 받은 zip이 있으면 data\\raw\\widerface\\ 에 넣고 실행하면 다운로드를 건너뛴다.
@@ -84,7 +84,7 @@ def main() -> None:
         stats = convert_widerface_to_yolo(str(RAW / "wider_face_split" / f"wider_face_{split}_bbx_gt.txt"),
                                           str(img_dir), str(OUT / split))
         print(f"{split} YOLO 라벨 변환:", stats)
-        make_review(OUT / split / "labels", img_dir, review_dir / split, *RANGES[initial])
+        make_review(OUT / split / "labels", img_dir, review_dir / split, *RANGES[initial], count=None)
 
     print(f"검수 폴더: {review_dir}")
     if sys.platform == "win32":

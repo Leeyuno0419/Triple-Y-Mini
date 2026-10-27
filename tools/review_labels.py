@@ -35,18 +35,21 @@ def draw_labels(img_path: Path, label_path: Path) -> Image.Image:
     return im
 
 
-def make_review(labels_dir: Path, img_dir: Path, out_dir: Path, lo: int = 0, hi: int = 61, count: int = 30) -> None:
-    """폴더 번호 lo~hi 범위에서 이미지를 count장 뽑아, 박스를 그린 검수용 이미지를 out_dir에 저장한다."""
+def make_review(labels_dir: Path, img_dir: Path, out_dir: Path, lo: int = 0, hi: int = 61,
+                count: int | None = 30) -> None:
+    """폴더 번호 lo~hi 범위에서 이미지를 count장 뽑아(None이면 전부), 박스를 그린 검수용 이미지를 out_dir에 저장한다."""
     images = {p.stem: p for p in img_dir.rglob("*.jpg")
               if lo <= int(p.parent.name.split("--")[0]) <= hi}
     labeled = sorted(s for s in images if (labels_dir / f"{s}.txt").exists())
     if not labeled:
         sys.exit(f"라벨이 있는 이미지가 없습니다. 변환을 먼저 실행했는지, 폴더 번호 범위({lo}-{hi})가 맞는지 확인하세요.")
 
+    picked = labeled if count is None else random.Random(SEED).sample(labeled, min(count, len(labeled)))
+    print(f"박스 그리는 중: {len(picked)}장")
     out_dir.mkdir(parents=True, exist_ok=True)
-    for stem in random.Random(SEED).sample(labeled, min(count, len(labeled))):
+    for stem in picked:
         draw_labels(images[stem], labels_dir / f"{stem}.txt").save(out_dir / f"{stem}.jpg", quality=90)
-    print(f"{min(count, len(labeled))}장 저장: {out_dir}")
+    print(f"{len(picked)}장 저장: {out_dir}")
 
 
 if __name__ == "__main__":
