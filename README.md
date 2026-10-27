@@ -48,9 +48,15 @@ pip install -r requirements.txt
 ```powershell
 python tools\prepare_widerface.py cyj      # 이니셜: lyn(폴더 0~20), cyj(21~40), nyr(41~61)
 ```
-1. train·val 이미지와 정답을 `data\raw\widerface\`에 받아 압축을 푼다 (이미 있으면 건너뜀, 디스크 약 4GB 필요).
+1. train·val 이미지와 정답을 `data\raw\widerface\`에 받아 압축을 푼다 (이미 있으면 건너뜀, 디스크 약 5GB 필요).
 2. train·val 정답을 YOLO 라벨로 바꾼다.
-3. 본인이 맡은 범위에서 train·val 각 30장에 박스를 그려 `data\processed\widerface\review\<이니셜>\train`, `val`에 저장하고 그 폴더를 연다.
+3. 본인이 맡은 범위의 **모든** train·val 이미지에 박스를 그려 `data\processed\widerface\review\<이니셜>\train`, `val`에 저장하고 그 폴더를 연다.
+
+| 이니셜 | 폴더 번호 | train | val | 합계 |
+|---|---|---|---|---|
+| lyn | 0~20 | 5,451 | 1,364 | 6,815 |
+| cyj | 21~40 | 3,759 | 942 | 4,701 |
+| nyr | 41~61 | 3,670 | 920 | 4,590 |
 
 - 볼 것: ① 박스가 얼굴에서 밀리거나 크기가 엉뚱한 것 ② 박스가 빠진 얼굴 (WIDER FACE는 아주 작거나 심하게 가려진 얼굴 일부를 원래 라벨하지 않음) ③ 박스 범위(이마·턱·귀)가 팀 라벨링 기준과 같은지
 - 이상한 이미지는 `train`/`val` 구분과 파일 이름, 무엇이 이상한지 팀에 공유한다.
