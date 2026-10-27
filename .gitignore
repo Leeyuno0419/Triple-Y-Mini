@@ -1,0 +1,29 @@
+# 비밀키
+.env
+
+# 데이터 (폴더 구조 유지용 .gitkeep만 추적)
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# 모델 가중치·학습 결과 (용량이 커서 Drive·서버로 공유)
+weights/*
+!weights/.gitkeep
+runs/
+*.pt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / 에디터
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
