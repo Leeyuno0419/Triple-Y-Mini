@@ -36,6 +36,28 @@ pip install -r requirements.txt
 - 데이터와 가중치(`best.pt`)는 git에 올리지 않으므로 팀 공유 폴더(Drive·서버)에서 받는다.
 - 기획서를 고친 뒤 PDF 재생성: `python tools\md_to_pdf.py 기획서.md 기획서.pdf` (reportlab, 맑은 고딕 글꼴 필요)
 
+## WIDER FACE 데이터 받기와 라벨 검수
+| 데이터 | 주소 | 용도 |
+|---|---|---|
+| train 이미지 (1.4GB) | [Drive](https://drive.google.com/file/d/15hGDLhsx8bLgLcIRD5DhYt5iBxnjNF1M/view?usp=sharing) | 학습 · 검수 |
+| val 이미지 (360MB) | [Drive](https://drive.google.com/file/d/1GUCogbp16PMGa39thoMMeWxp7Rp5oM8Q/view?usp=sharing) | 검증 · 검수 |
+| test 이미지 (1.8GB) | [Drive](https://drive.google.com/file/d/1HIfDbVEWKmsYKJZm4lchTBDLW5N7dY5T/view?usp=sharing) | 정답 박스가 공개되지 않아 쓰지 않음 |
+| 정답 박스 (annotations) | [wider_face_split.zip](http://shuoyang1213.me/WIDERFACE/support/bbx_annotation/wider_face_split.zip) | train·val 정답 |
+
+**검수 방법:** 위 [시작하기](#시작하기)로 clone과 `pip install`을 마친 뒤, 프로젝트 폴더에서 본인 이니셜로 실행한다.
+```powershell
+python tools\prepare_widerface.py cyj      # 이니셜: lyn(폴더 0~20), cyj(21~40), nyr(41~61)
+```
+1. train·val 이미지와 정답을 `data\raw\widerface\`에 받아 압축을 푼다 (이미 있으면 건너뜀, 디스크 약 4GB 필요).
+2. train·val 정답을 YOLO 라벨로 바꾼다.
+3. 본인이 맡은 범위에서 train·val 각 30장에 박스를 그려 `data\processed\widerface\review\<이니셜>\train`, `val`에 저장하고 그 폴더를 연다.
+
+- 볼 것: ① 박스가 얼굴에서 밀리거나 크기가 엉뚱한 것 ② 박스가 빠진 얼굴 (WIDER FACE는 아주 작거나 심하게 가려진 얼굴 일부를 원래 라벨하지 않음) ③ 박스 범위(이마·턱·귀)가 팀 라벨링 기준과 같은지
+- 이상한 이미지는 `train`/`val` 구분과 파일 이름, 무엇이 이상한지 팀에 공유한다.
+- 다운로드가 실패하면 위 주소에서 브라우저로 받아 zip을 `data\raw\widerface\`에 넣고 다시 실행한다.
+- 압축 풀기가 중간에 끊겼으면 `data\raw\widerface\` 안의 풀다 만 폴더(`WIDER_train` 등)를 지우고 다시 실행한다.
+- 얼굴 데이터이므로 `data\`의 어떤 파일도 git에 올리지 않는다 (`.gitignore`로 제외됨).
+
 ## 협업 규칙
 ### 브랜치
 | 브랜치 | 용도 | 누가 |
