@@ -17,7 +17,7 @@ Triple Y Mini/
 │  └─ processed/  # 전처리 결과 (git 제외)
 ├─ weights/      # 모델 가중치 best.pt 등 (git 제외)
 ├─ tools/        # 보조 스크립트 (md_to_pdf.py 등)
-├─ 기획서.md, 기획서.pdf, 역할별_구현명세.md
+├─ 기획서.md, 기획서.pdf, 역할별_구현명세.md, 진행현황.md
 ├─ requirements.txt
 └─ .env          # 비밀키 (git 제외)
 ```
