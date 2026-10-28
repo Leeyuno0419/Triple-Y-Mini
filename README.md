@@ -36,6 +36,30 @@ pip install -r requirements.txt
 - 데이터와 가중치(`best.pt`)는 git에 올리지 않으므로 팀 공유 폴더(Drive·서버)에서 받는다.
 - 기획서를 고친 뒤 PDF 재생성: `python tools\md_to_pdf.py 기획서.md 기획서.pdf` (reportlab, 맑은 고딕 글꼴 필요)
 
+## 얼굴 탐지 모델 준비 (`detect_faces`)
+지금은 사전학습 가중치 [yolov11n-face](https://github.com/akanametov/yolo-face) (WIDER FACE로 학습, GPL-3.0)를 `weights\best.pt`로 쓴다. 직접 학습한 모델이 나오면 A가 `best.pt`만 교체한다.
+```powershell
+Invoke-WebRequest https://github.com/akanametov/yolo-face/releases/download/1.0.0/yolov11n-face.pt -OutFile weights\best.pt
+```
+Colab에서는 [tools/colab_detector.ipynb](tools/colab_detector.ipynb)를 열어 위에서부터 실행한다 (사진 탐지·영상 추적 확인 포함). 직접 입력할 때는:
+```
+!git clone https://github.com/Leeyuno0419/Triple-Y-Mini.git
+%cd Triple-Y-Mini
+!pip install -r requirements.txt
+!wget -O weights/best.pt https://github.com/akanametov/yolo-face/releases/download/1.0.0/yolov11n-face.pt
+```
+사용 예 (프로젝트 루트에서 실행):
+```python
+import cv2
+from src.detector import detect_faces, reset_tracker
+
+img = cv2.imread("사진.jpg")               # BGR
+boxes = detect_faces(img)                  # [{"xyxy": (x1, y1, x2, y2), "conf": 0.9, "track_id": None}, ...]
+reset_tracker()                            # 영상마다 처음에 한 번
+boxes = detect_faces(frame, track=True)    # 프레임마다, track_id가 붙음
+```
+- `src\` 안의 파일을 `python src\xxx.py`로 직접 실행하지 않는다. `src\types.py`가 표준 라이브러리 `types`와 이름이 겹친다.
+
 ## WIDER FACE 데이터 받기와 라벨 검수
 | 데이터 | 주소 | 용도 |
 |---|---|---|
