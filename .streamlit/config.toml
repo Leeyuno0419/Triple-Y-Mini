@@ -1,0 +1,11 @@
+# 웹 데모 색상 테마. OS가 다크 모드여도 흰 카드 위 글자가 보이도록 라이트 테마로 고정한다.
+[theme]
+base = "light"
+primaryColor = "#111418"
+backgroundColor = "#FDFCF7"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#111418"
+
+# app/static/ 안의 이미지를 /app/static/파일명 주소로 보여 준다 (하단 바 로고에 사용)
+[server]
+enableStaticServing = true
