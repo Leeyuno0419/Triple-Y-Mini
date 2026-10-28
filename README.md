@@ -37,11 +37,11 @@ pip install -r requirements.txt
 - 기획서를 고친 뒤 PDF 재생성: `python tools\md_to_pdf.py 기획서.md 기획서.pdf` (reportlab, 맑은 고딕 글꼴 필요)
 
 ## 얼굴 탐지 모델 준비 (`detect_faces`)
-지금은 사전학습 가중치 [yolov11n-face](https://github.com/akanametov/yolo-face) (WIDER FACE로 학습, GPL-3.0)를 `weights\best.pt`로 쓴다. 직접 학습한 모델이 나오면 A가 `best.pt`만 교체한다.
+지금은 사전학습 가중치 [yolov11n-face](https://github.com/akanametov/yolo-face) (WIDER FACE로 학습, GPL-3.0)를 `weights\best.pt`로 쓴다. 직접 학습을 하기로 해서 모델이 나오면 A가 `best.pt`만 교체한다.
 ```powershell
 Invoke-WebRequest https://github.com/akanametov/yolo-face/releases/download/1.0.0/yolov11n-face.pt -OutFile weights\best.pt
 ```
-Colab에서는 [tools/colab_detector.ipynb](tools/colab_detector.ipynb)를 열어 위에서부터 실행한다 (사진 탐지·영상 추적 확인 포함). 직접 입력할 때는:
+Colab에서는 [tools/colab_detector.ipynb](tools/colab_detector.ipynb)를 열어 위에서부터 실행한다 (사진 탐지·영상 추적 확인 포함). 유튜브 주소와 구간을 넣어 탐지 결과 영상을 만들려면 [tools/youtube_detect.ipynb](tools/youtube_detect.ipynb)를 쓴다. 직접 입력할 때는:
 ```
 !git clone https://github.com/Leeyuno0419/Triple-Y-Mini.git
 %cd Triple-Y-Mini
@@ -59,34 +59,6 @@ reset_tracker()                            # 영상마다 처음에 한 번
 boxes = detect_faces(frame, track=True)    # 프레임마다, track_id가 붙음
 ```
 - `src\` 안의 파일을 `python src\xxx.py`로 직접 실행하지 않는다. `src\types.py`가 표준 라이브러리 `types`와 이름이 겹친다.
-
-## WIDER FACE 데이터 받기와 라벨 검수
-| 데이터 | 주소 | 용도 |
-|---|---|---|
-| train 이미지 (1.4GB) | [Drive](https://drive.google.com/file/d/15hGDLhsx8bLgLcIRD5DhYt5iBxnjNF1M/view?usp=sharing) | 학습 · 검수 |
-| val 이미지 (360MB) | [Drive](https://drive.google.com/file/d/1GUCogbp16PMGa39thoMMeWxp7Rp5oM8Q/view?usp=sharing) | 검증 · 검수 |
-| test 이미지 (1.8GB) | [Drive](https://drive.google.com/file/d/1HIfDbVEWKmsYKJZm4lchTBDLW5N7dY5T/view?usp=sharing) | 정답 박스가 공개되지 않아 쓰지 않음 |
-| 정답 박스 (annotations) | [wider_face_split.zip](http://shuoyang1213.me/WIDERFACE/support/bbx_annotation/wider_face_split.zip) | train·val 정답 |
-
-**검수 방법:** 위 [시작하기](#시작하기)로 clone과 `pip install`을 마친 뒤, 프로젝트 폴더에서 본인 이니셜로 실행한다.
-```powershell
-python tools\prepare_widerface.py cyj      # 이니셜: lyn(폴더 0~20), cyj(21~40), nyr(41~61)
-```
-1. train·val 이미지와 정답을 `data\raw\widerface\`에 받아 압축을 푼다 (이미 있으면 건너뜀, 디스크 약 5GB 필요).
-2. train·val 정답을 YOLO 라벨로 바꾼다.
-3. 본인이 맡은 범위의 **모든** train·val 이미지에 박스를 그려 `data\processed\widerface\review\<이니셜>\train`, `val`에 저장하고 그 폴더를 연다.
-
-| 이니셜 | 폴더 번호 | train | val | 합계 |
-|---|---|---|---|---|
-| lyn | 0~20 | 5,451 | 1,364 | 6,815 |
-| cyj | 21~40 | 3,759 | 942 | 4,701 |
-| nyr | 41~61 | 3,670 | 920 | 4,590 |
-
-- 볼 것: ① 박스가 얼굴에서 밀리거나 크기가 엉뚱한 것 ② 박스가 빠진 얼굴 (WIDER FACE는 아주 작거나 심하게 가려진 얼굴 일부를 원래 라벨하지 않음) ③ 박스 범위(이마·턱·귀)가 팀 라벨링 기준과 같은지
-- 이상한 이미지는 `train`/`val` 구분과 파일 이름, 무엇이 이상한지 팀에 공유한다.
-- 다운로드가 실패하면 위 주소에서 브라우저로 받아 zip을 `data\raw\widerface\`에 넣고 다시 실행한다.
-- 압축 풀기가 중간에 끊겼으면 `data\raw\widerface\` 안의 풀다 만 폴더(`WIDER_train` 등)를 지우고 다시 실행한다.
-- 얼굴 데이터이므로 `data\`의 어떤 파일도 git에 올리지 않는다 (`.gitignore`로 제외됨).
 
 ## 협업 규칙
 ### 브랜치
