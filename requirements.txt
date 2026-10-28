@@ -1,3 +1,5 @@
 # 팀 공용 패키지 목록. 패키지를 추가하면 여기에 버전과 함께 적는다. (예: pandas==2.2.2)
 reportlab==4.4.3  # tools/md_to_pdf.py (기획서 PDF 변환)
 Pillow>=10.1  # src/dataset.py, tools/review_labels.py (이미지 크기 읽기, 박스 그리기). Python 3.8~3.14+ 모두 설치되도록 범위로 지정
+ultralytics==8.4.177  # src/detector.py (YOLO 탐지·ByteTrack 추적). torch·opencv·numpy를 함께 설치
+lap>=0.5.12  # ByteTrack 매칭에 필요. 없으면 ultralytics가 실행 중에 자동 설치를 시도함
