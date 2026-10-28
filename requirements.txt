@@ -2,3 +2,4 @@
 reportlab==4.4.3  # tools/md_to_pdf.py (기획서 PDF 변환)
 ultralytics==8.4.177  # src/detector.py (YOLO 탐지·ByteTrack 추적). torch·opencv·numpy를 함께 설치
 lap>=0.5.12  # ByteTrack 매칭에 필요. 없으면 ultralytics가 실행 중에 자동 설치를 시도함
+streamlit==1.40.1  # app/app.py (웹 데모). Python 3.8에서 설치되는 최신 버전
