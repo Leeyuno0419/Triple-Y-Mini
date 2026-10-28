@@ -483,12 +483,13 @@ def on_image(image_rgb: np.ndarray, ref_embs: Optional[np.ndarray]) -> tuple[np.
     # │ [C파트 모듈] src/exclude.py  : filter_excluded           │
     # └─────────────────────────────────────────────────────────┘
     from src.detector import detect_faces
-    from src.exclude import filter_excluded
     from src.mosaic import apply_mosaic
 
     img_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)   # 입구: 웹은 RGB, 모듈은 BGR
     boxes = detect_faces(img_bgr)
     if ref_embs is not None:                               # 제외 인물이 등록돼 있을 때만
+        from src.exclude import filter_excluded            # (등록 시에만 불러와 C파트 없이도 사진은 동작)
+
         boxes = filter_excluded(img_bgr, boxes, ref_embs)  # 그 사람 박스를 뺀다
     result_bgr = apply_mosaic(img_bgr, boxes)
     return cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB), len(boxes)   # 출구: 다시 RGB
