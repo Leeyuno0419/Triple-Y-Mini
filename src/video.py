@@ -185,6 +185,66 @@ class BoxHolder:
         return current + held
 
 
+def merge_audio_h264(video_path: str, audio_src: str, out_path: str) -> None:
+    """처리 영상에 원본의 오디오를 선택적으로 합치고 H.264 MP4로 저장한다.
+
+    입력에 오디오 트랙이 없어도 영상만 출력한다. ffmpeg가 없거나 인코딩에
+    실패하면 RuntimeError를 발생시킨다.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg를 찾을 수 없습니다. 설치 후 PATH에 등록해 주세요.")
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.resolve() in (Path(video_path).resolve(), Path(audio_src).resolve()):
+        raise ValueError("출력 경로는 입력 영상 경로와 달라야 합니다.")
+
+    fd, temp_name = tempfile.mkstemp(prefix=f"{out.stem}_", suffix=out.suffix or ".mp4", dir=out.parent)
+    os.close(fd)
+    encoded_temp = Path(temp_name)
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        video_path,
+        "-i",
+        audio_src,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        str(encoded_temp),
+    ]
+    try:
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+        except OSError as err:
+            raise RuntimeError(f"ffmpeg를 실행할 수 없습니다: {err}") from err
+        if result.returncode != 0 or not encoded_temp.is_file() or encoded_temp.stat().st_size == 0:
+            detail = result.stderr.strip()[-1200:] or "알 수 없는 ffmpeg 오류"
+            raise RuntimeError(f"ffmpeg 영상 인코딩에 실패했습니다: {detail}")
+        encoded_temp.replace(out)
+    finally:
+        encoded_temp.unlink(missing_ok=True)
+
+
 def _load_exclusion_filter():
     """제외 모듈이 있으면 필터를 반환하고, 모듈 부재는 None으로 알린다."""
     try:
