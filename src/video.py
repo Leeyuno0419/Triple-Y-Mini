@@ -4,8 +4,18 @@
 """
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+import warnings
 from dataclasses import dataclass
-from typing import Optional
+from pathlib import Path
+from typing import Callable, Optional
+
+import cv2
+import numpy as np
 
 from src.config import HOLD_FRAMES, UNTRACKED_HOLD_FRAMES, UNTRACKED_MATCH_IOU
 from src.types import Box
@@ -173,3 +183,121 @@ class BoxHolder:
                 held.append(self._predict_box(state, frame_idx))
 
         return current + held
+
+
+def _load_exclusion_filter():
+    """제외 모듈이 있으면 필터를 반환하고, 모듈 부재는 None으로 알린다."""
+    try:
+        from src.exclude import filter_excluded
+    except ModuleNotFoundError as err:
+        if err.name != "src.exclude":
+            raise
+        return None
+    return filter_excluded
+
+
+def process_video(
+    in_path: str,
+    out_path: str,
+    ref_embs: Optional[np.ndarray] = None,
+    on_progress: Optional[Callable[[float], None]] = None,
+) -> dict:
+    """영상의 얼굴을 추적·모자이크하고 결과 정보 dict를 반환한다.
+
+    반환 키는 ``faces``, ``frames``, ``fps``, ``seconds``이다. ``faces``는
+    track ID가 있는 고유 인원 수이며, FPS와 시간은 출력 인코딩까지 포함한다.
+    """
+    from src.detector import detect_faces, reset_tracker
+    from src.mosaic import apply_mosaic
+
+    in_file = Path(in_path)
+    out_file = Path(out_path)
+    if not in_file.is_file():
+        raise ValueError(f"입력 영상을 찾을 수 없습니다: {in_path}")
+    if in_file.resolve() == out_file.resolve():
+        raise ValueError("출력 경로는 입력 영상 경로와 달라야 합니다.")
+
+    filter_excluded = _load_exclusion_filter() if ref_embs is not None else None
+    if ref_embs is not None and filter_excluded is None:
+        warnings.warn(
+            "src.exclude를 찾을 수 없어 등록 인물도 포함해 모든 얼굴을 모자이크합니다.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    reset_tracker()
+    capture = cv2.VideoCapture(str(in_file))
+    if not capture.isOpened():
+        capture.release()
+        raise ValueError("영상을 열 수 없습니다. 파일이 깨졌는지 확인해 주세요.")
+
+    fps_src = capture.get(cv2.CAP_PROP_FPS)
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    if fps_src <= 0 or width <= 0 or height <= 0:
+        capture.release()
+        raise ValueError("영상의 프레임 속도 또는 해상도를 읽을 수 없습니다.")
+
+    holder = BoxHolder()
+    exclude_cache: dict = {}
+    track_ids: set[int] = set()
+    processed_frames = 0
+    start = time.perf_counter()
+
+    try:
+        if on_progress is not None:
+            on_progress(0.0)
+        with tempfile.TemporaryDirectory(prefix="triple_y_video_") as temp_dir:
+            intermediate = Path(temp_dir) / "mosaiced.mp4"
+            writer = cv2.VideoWriter(
+                str(intermediate), cv2.VideoWriter_fourcc(*"mp4v"), fps_src, (width, height)
+            )
+            if not writer.isOpened():
+                writer.release()
+                raise RuntimeError("처리 영상을 저장할 코덱을 열 수 없습니다.")
+
+            try:
+                while True:
+                    ok, frame = capture.read()
+                    if not ok:
+                        break
+                    if frame.shape[1] != width or frame.shape[0] != height:
+                        raise ValueError("영상 프레임의 해상도가 일정하지 않습니다.")
+
+                    boxes = detect_faces(frame, track=True)
+                    for box in boxes:
+                        if box["track_id"] is not None:
+                            track_ids.add(box["track_id"])
+                    boxes = holder.update(boxes, processed_frames)
+
+                    if filter_excluded is not None:
+                        boxes = filter_excluded(frame, boxes, ref_embs, cache=exclude_cache)
+                    writer.write(apply_mosaic(frame, boxes))
+                    processed_frames += 1
+
+                    if on_progress is not None and total_frames > 0:
+                        on_progress(min(processed_frames / total_frames, 1.0))
+            finally:
+                writer.release()
+                capture.release()
+
+            if processed_frames == 0:
+                raise ValueError("영상에서 처리할 프레임을 읽지 못했습니다.")
+
+            merge_audio_h264(str(intermediate), str(in_file), str(out_file))
+    except Exception:
+        capture.release()
+        raise
+
+    if on_progress is not None:
+        on_progress(1.0)
+
+    seconds = time.perf_counter() - start
+    return {
+        "faces": len(track_ids),
+        "frames": processed_frames,
+        "fps": processed_frames / seconds if seconds > 0 else 0.0,
+        "seconds": seconds,
+    }
