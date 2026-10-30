@@ -3,3 +3,6 @@ reportlab==4.4.3  # tools/md_to_pdf.py (기획서 PDF 변환)
 ultralytics==8.4.177  # src/detector.py (YOLO 탐지·ByteTrack 추적). torch·opencv·numpy를 함께 설치
 lap>=0.5.12  # ByteTrack 매칭에 필요. 없으면 ultralytics가 실행 중에 자동 설치를 시도함
 streamlit==1.40.1  # app/app.py (웹 데모). Python 3.8에서 설치되는 최신 버전
+insightface>=1.0.1  # src/exclude.py (인물 등록·제외 얼굴 인식). 순수 파이썬 wheel이라 C++ 빌드 불필요. Python 3.8은 1.0.1, 3.10 이상은 2.x가 설치됨 (2.x는 Python 3.10 이상 필요)
+onnxruntime>=1.16  # InsightFace 추론 (CPU). Python 3.8은 1.19.2까지, 3.11은 최신. GPU는 onnxruntime-gpu로 바꿔 설치 (없으면 CPU로 자동 동작)
+imageio-ffmpeg>=0.5.1  # app/app.py (영상 결과를 브라우저 재생용 H.264 로 바꾸고 원본 소리를 합칠 때 쓰는 ffmpeg 실행 파일). 시스템에 ffmpeg 가 있으면 그것을 먼저 씀

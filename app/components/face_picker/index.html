@@ -1,0 +1,253 @@
+<!doctype html>
+<!--
+  얼굴 선택 컴포넌트 (Streamlit 커스텀 컴포넌트, 패키지 설치 없이 바닐라 JS 로 만든다).
+
+  mode = "boxes"   : 사진·영상 프레임 위에 얼굴 박스를 그린다.
+                     박스를 클릭하면 '제외할 얼굴' 로 바뀌고(다시 클릭하면 해제),
+                     빈 곳을 드래그하면 직접 가릴 영역이 추가된다. 영역은 끌어서 옮기고, 오른쪽 아래 점으로 크기를 바꾸고, × 로 지운다.
+
+  Python(app.py)에서 받는 값(args)과 돌려주는 값은 app.py 의 face_picker() 설명을 본다.
+  좌표는 모두 "캔버스 좌표"(가로 cw × 세로 ch)다. 원본 픽셀로 되돌리는 일은 app.py 가 한다.
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { --ink: #111418; --muted: #6B7280; --line: #E5E7EB; --mint: #CDEFE2; --mint-line: #9FD9C2; --sky-soft: #F1F8FE; }
+  html, body { margin: 0; padding: 0; background: transparent; color: var(--ink);
+               font-family: "Source Sans Pro", "Segoe UI", "Malgun Gothic", sans-serif; }
+  #root { padding: 2px 0 4px; }
+
+  /* 사진 칸: 16:9 캔버스 안에 사진이 비율대로 들어가 있다 (결과 사진 칸과 같은 모양) */
+  #stage { position: relative; width: 100%; aspect-ratio: 16 / 9; border-radius: 12px; overflow: hidden;
+           touch-action: none; user-select: none; -webkit-user-select: none; cursor: crosshair; }
+  #photo { position: absolute; display: block; }
+  #layer { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+
+  /* 박스 모양: 가릴 얼굴은 검정 실선, 제외할 얼굴은 민트 점선, 직접 지정한 영역은 하늘색 */
+  .face rect.box { fill: rgba(17, 20, 24, .10); stroke: var(--ink); stroke-width: 2; vector-effect: non-scaling-stroke; cursor: pointer; }
+  .face.out rect.box { fill: rgba(159, 217, 194, .28); stroke: var(--mint-line); stroke-dasharray: 7 5; }
+  .face.low rect.box { stroke-dasharray: 3 3; }
+  .manual rect.box { fill: rgba(158, 210, 246, .30); stroke: #3B8FD0; stroke-width: 2; vector-effect: non-scaling-stroke; cursor: move; }
+  .manual rect.draft { fill: rgba(158, 210, 246, .18); stroke: #3B8FD0; stroke-width: 2; stroke-dasharray: 5 4; vector-effect: non-scaling-stroke; }
+  .tag-bg { fill: var(--ink); }
+  .face.out .tag-bg { fill: var(--mint-line); }
+  .manual .tag-bg { fill: #3B8FD0; }
+  .tag-text { fill: #fff; font-weight: 700; pointer-events: none; }
+  .face.out .tag-text { fill: #0F3B57; }
+  .handle { fill: #fff; stroke: #3B8FD0; stroke-width: 2; vector-effect: non-scaling-stroke; }
+  .del { fill: #fff; stroke: #3B8FD0; stroke-width: 2; vector-effect: non-scaling-stroke; cursor: pointer; }
+  .del-x { stroke: #3B8FD0; stroke-width: 2; vector-effect: non-scaling-stroke; pointer-events: none; }
+
+  /* 아래 줄: 초기화 버튼 (앱의 검정 알약 버튼과 같은 모양), 사진 바로 아래 가운데 */
+  #bar { display: flex; flex-direction: column; align-items: center; gap: 6px; margin-top: 8px; }
+  button.pill { order: 1; background: var(--ink); color: #fff; border: none; border-radius: 999px; padding: 4px 14px;
+                font-weight: 600; font-size: 12px; cursor: pointer; white-space: nowrap; font-family: inherit; }
+  button.pill:hover { background: #2E3640; }
+
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+(function () {
+  "use strict";
+
+  // ---- Streamlit 과 주고받는 부분 (streamlit-component-lib 없이 postMessage 로 직접 한다) ----
+  function send(type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*");
+  }
+  function setValue(value) { send("streamlit:setComponentValue", { value: value, dataType: "json" }); }
+  // 높이는 iframe 자신의 높이가 아니라 내용(#root)의 높이로 잰다. documentElement.scrollHeight 는 iframe 보다 작아지지 않아서,
+  // 높이를 키울 때마다 +4 가 다시 더해지는 무한 반복이 되어 카드가 수만 px 로 늘어났다. 값이 바뀔 때만 알린다.
+  var lastHeight = -1;
+  function setHeight() {
+    var h = Math.ceil(document.getElementById("root").getBoundingClientRect().height) + 2;
+    if (h !== lastHeight) { lastHeight = h; send("streamlit:setFrameHeight", { height: h }); }
+  }
+
+  var root = document.getElementById("root");
+  var currentToken = null;
+  var args = null;
+
+  window.addEventListener("message", function (ev) {
+    var data = ev.data;
+    if (!data || data.type !== "streamlit:render") return;
+    var next = data.args || {};
+    if (next.token !== currentToken) {        // 다른 파일·다른 검출 결과일 때만 처음부터 다시 그린다
+      currentToken = next.token;
+      args = next;
+      buildBoxes();
+    }
+    setHeight();
+  });
+  send("streamlit:componentReady", { apiVersion: 1 });
+  if (window.ResizeObserver) new ResizeObserver(setHeight).observe(document.getElementById("root"));
+
+  // ---- 공통 도우미 ----
+  function el(tag, attrs, parent) {
+    var node = document.createElement(tag);
+    Object.keys(attrs || {}).forEach(function (k) { node[k] = attrs[k]; });
+    if (parent) parent.appendChild(node);
+    return node;
+  }
+  var SVG_NS = "http://www.w3.org/2000/svg";
+  function svg(tag, attrs, parent) {
+    var node = document.createElementNS(SVG_NS, tag);
+    Object.keys(attrs || {}).forEach(function (k) { node.setAttribute(k, attrs[k]); });
+    if (parent) parent.appendChild(node);
+    return node;
+  }
+  function sortedNumbers(set) { return Array.from(set).sort(function (a, b) { return a - b; }); }
+
+  // ============================================================
+  // mode = "boxes": 사진 위에서 얼굴 클릭 · 영역 그리기
+  // ============================================================
+  function buildBoxes() {
+    root.innerHTML = "";
+    var CW = args.cw, CH = args.ch;
+    var faces = args.boxes || [];
+    var excluded = new Set(args.excluded || []);
+    var manual = (args.manual || []).map(function (m) { return m.slice(0, 4); });
+    var lowConf = args.lowConf || 0;
+    var MIN_SIZE = 14;                        // 이보다 작은 드래그는 영역으로 치지 않는다 (캔버스 픽셀)
+
+    var stage = el("div", { id: "stage" }, root);
+    var photo = el("img", { id: "photo", src: args.img.src, draggable: false }, stage);
+    photo.style.left = (args.img.x / CW * 100) + "%";
+    photo.style.top = (args.img.y / CH * 100) + "%";
+    photo.style.width = (args.img.w / CW * 100) + "%";
+    photo.style.height = (args.img.h / CH * 100) + "%";
+    var layer = svg("svg", { id: "layer", viewBox: "0 0 " + CW + " " + CH, preserveAspectRatio: "none" }, stage);
+
+    var bar = el("div", { id: "bar" }, root);
+    var reset = el("button", { className: "pill", textContent: "초기화" }, bar);
+
+    var drag = null;                          // 지금 하고 있는 드래그 {kind, ...}
+
+    function scale() { return CW / stage.clientWidth; }   // 화면 1px 이 캔버스 몇 px 인지
+    function toCanvas(ev) {
+      var r = stage.getBoundingClientRect();
+      return [(ev.clientX - r.left) * CW / r.width, (ev.clientY - r.top) * CH / r.height];
+    }
+    function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+    function norm(r) {                        // 모서리를 (왼쪽 위, 오른쪽 아래) 순서로 정리하고 캔버스 안으로 자른다
+      var x1 = clamp(Math.min(r[0], r[2]), 0, CW), x2 = clamp(Math.max(r[0], r[2]), 0, CW);
+      var y1 = clamp(Math.min(r[1], r[3]), 0, CH), y2 = clamp(Math.max(r[1], r[3]), 0, CH);
+      return [x1, y1, x2, y2];
+    }
+    function emit() {
+      setValue({
+        excluded: sortedNumbers(excluded),
+        manual: manual.map(function (m) { return m.map(function (v) { return Math.round(v); }); })
+      });
+    }
+
+    function tag(group, x, y, text, fs) {     // 박스 왼쪽 위의 작은 이름표
+      var w = text.length * fs * 0.62 + fs * 1.2, h = fs * 1.5;
+      svg("rect", { "class": "tag-bg", x: x, y: Math.max(0, y - h), width: w, height: h, rx: h / 2 }, group);
+      var t = svg("text", { "class": "tag-text", x: x + fs * 0.6, y: Math.max(0, y - h) + h * 0.72, "font-size": fs }, group);
+      t.textContent = text;
+    }
+
+    function draw() {
+      layer.innerHTML = "";
+      var s = scale(), fs = 12 * s, hr = 7 * s;
+      faces.forEach(function (f) {
+        var out = excluded.has(f.id);
+        var low = lowConf > 0 && f.conf < lowConf;
+        var g = svg("g", { "class": "face" + (out ? " out" : "") + (low ? " low" : ""), "data-id": f.id }, layer);
+        svg("rect", { "class": "box", x: f.x1, y: f.y1, width: f.x2 - f.x1, height: f.y2 - f.y1 }, g);
+        var label = (out ? (f.auto ? "제외·등록 인물" : "제외") : "가림") + " " + Math.round(f.conf * 100) + "%" + (low ? " 낮음" : "");
+        tag(g, f.x1, f.y1, label, fs);
+      });
+      manual.forEach(function (m, i) {
+        var g = svg("g", { "class": "manual", "data-i": i }, layer);
+        svg("rect", { "class": "box", x: m[0], y: m[1], width: m[2] - m[0], height: m[3] - m[1] }, g);
+        tag(g, m[0], m[1], "직접 영역", fs);
+        svg("circle", { "class": "handle", cx: m[2], cy: m[3], r: hr, "data-role": "resize" }, g).style.cursor = "nwse-resize";
+        svg("circle", { "class": "del", cx: m[2], cy: m[1], r: hr, "data-role": "del" }, g);
+        var d = hr * 0.45;
+        svg("line", { "class": "del-x", x1: m[2] - d, y1: m[1] - d, x2: m[2] + d, y2: m[1] + d }, g);
+        svg("line", { "class": "del-x", x1: m[2] - d, y1: m[1] + d, x2: m[2] + d, y2: m[1] - d }, g);
+      });
+      if (drag && drag.kind === "draw") {
+        var r = norm(drag.rect);
+        svg("rect", { "class": "draft", x: r[0], y: r[1], width: r[2] - r[0], height: r[3] - r[1] }, svg("g", { "class": "manual" }, layer));
+      }
+    }
+
+    function hit(ev) {                        // 포인터 아래의 도형: {type, id|i, role}
+      var node = document.elementFromPoint(ev.clientX, ev.clientY);
+      while (node && node !== layer) {
+        if (node.getAttribute && /(^| )face( |$)/.test(node.getAttribute("class") || "")) {
+          return { type: "face", id: Number(node.getAttribute("data-id")) };
+        }
+        if (node.getAttribute && node.getAttribute("data-role")) {
+          var grp = node.parentNode;
+          return { type: "manual", i: Number(grp.getAttribute("data-i")), role: node.getAttribute("data-role") };
+        }
+        if (node.getAttribute && /(^| )manual( |$)/.test(node.getAttribute("class") || "") && node.getAttribute("data-i") !== null) {
+          return { type: "manual", i: Number(node.getAttribute("data-i")), role: "move" };
+        }
+        node = node.parentNode;
+      }
+      return null;
+    }
+
+    stage.addEventListener("pointerdown", function (ev) {
+      stage.setPointerCapture(ev.pointerId);
+      var p = toCanvas(ev), h = hit(ev);
+      if (h && h.type === "manual") {
+        if (h.role === "del") { manual.splice(h.i, 1); draw(); emit(); drag = null; return; }
+        drag = { kind: h.role, i: h.i, start: p, orig: manual[h.i].slice() };
+      } else if (h && h.type === "face") {
+        drag = { kind: "face", id: h.id, start: p, moved: false };
+      } else {
+        drag = { kind: "draw", start: p, rect: [p[0], p[1], p[0], p[1]] };
+      }
+    });
+    stage.addEventListener("pointermove", function (ev) {
+      if (!drag) return;
+      var p = toCanvas(ev), dx = p[0] - drag.start[0], dy = p[1] - drag.start[1];
+      if (drag.kind === "draw") { drag.rect = [drag.start[0], drag.start[1], p[0], p[1]]; draw(); }
+      else if (drag.kind === "move") {
+        var o = drag.orig, w = o[2] - o[0], h = o[3] - o[1];
+        var x1 = clamp(o[0] + dx, 0, CW - w), y1 = clamp(o[1] + dy, 0, CH - h);
+        manual[drag.i] = [x1, y1, x1 + w, y1 + h]; draw();
+      } else if (drag.kind === "resize") {
+        var o2 = drag.orig;
+        manual[drag.i] = norm([o2[0], o2[1], o2[2] + dx, o2[3] + dy]); draw();
+      } else if (drag.kind === "face" && Math.hypot(dx, dy) > 4 * scale()) { drag.moved = true; }
+    });
+    function finish(ev) {
+      if (!drag) return;
+      var d = drag; drag = null;
+      if (d.kind === "face") {
+        if (!d.moved) { if (excluded.has(d.id)) excluded.delete(d.id); else excluded.add(d.id); draw(); emit(); } else draw();
+      } else if (d.kind === "draw") {
+        var r = norm(d.rect);
+        if (r[2] - r[0] >= MIN_SIZE && r[3] - r[1] >= MIN_SIZE) { manual.push(r); emit(); }
+        draw();
+      } else {                                 // move / resize 가 끝났다. 너무 작아졌으면 지운다
+        var m = manual[d.i];
+        if (m && (m[2] - m[0] < MIN_SIZE || m[3] - m[1] < MIN_SIZE)) manual.splice(d.i, 1);
+        draw(); emit();
+      }
+    }
+    stage.addEventListener("pointerup", finish);
+    stage.addEventListener("pointercancel", function () { drag = null; draw(); });
+
+    reset.addEventListener("click", function () {
+      excluded = new Set(args.resetExcluded || []);
+      manual = [];
+      draw(); emit();
+    });
+    new ResizeObserver(draw).observe(stage);   // 창 크기가 바뀌면 이름표·점 크기를 다시 맞춘다
+    draw();
+  }
+
+})();
+</script>
+</body>
+</html>
