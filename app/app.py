@@ -660,7 +660,7 @@ def render_video(uploaded: UploadedFile) -> None:
         out_path, info = on_video(in_path, st.session_state["ref_embs"], on_progress=bar.progress)
     except ImportError as err:
         show_module_missing(err)
-    except (ValueError, BusyError) as err:    # 길이·해상도 초과, 다른 처리 중
+    except (ValueError, RuntimeError) as err:  # 입력 제한·처리 실패, 다른 처리 중
         st.error(str(err))
     else:
         with col_result:
