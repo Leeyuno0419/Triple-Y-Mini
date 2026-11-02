@@ -18,6 +18,8 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+# 유튜브 라이브용 최신 yt-dlp 환경 (tools/setup_ytdlp.py 로 만든다)
+.venv-ytdlp/
 
 # Jupyter
 .ipynb_checkpoints/

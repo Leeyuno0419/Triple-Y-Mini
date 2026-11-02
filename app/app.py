@@ -28,6 +28,7 @@ import importlib.util
 import inspect
 import io
 import json
+import logging
 import math
 import os
 import shutil
@@ -37,6 +38,7 @@ import tempfile
 import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterator, Optional
@@ -60,7 +62,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.config import MAX_VIDEO_SECONDS, MAX_VIDEO_SHORT_SIDE, PAD    # 영상 제한(1분·720p)과 블러 여백은 공통 설정 파일에서 읽는다
+from src.config import LIVE_VIEW_REFRESH, MAX_VIDEO_SECONDS, MAX_VIDEO_SHORT_SIDE, PAD, SIM_THRESHOLD, STREAM_IDLE_STOP    # 영상 제한(1분·720p)과 블러 여백은 공통 설정 파일에서 읽는다
 
 # ============================================================
 # 1. 기본 설정
@@ -103,12 +105,10 @@ DISPLAY_SIZE = (1280, 720)
 # TODO: 위와 같이 팀에 알린 뒤 config.py 로 옮긴다.
 MAX_IMAGE_FILES = 20
 
-# 가리는 방식 (사진만. 영상은 B파트 video.py 가 모자이크만 지원한다)
+# 가리는 방식 (사진·영상 모두. 블러 세기는 src/config.py 의 BLUR_SIGMA_RATIO · BLUR_EDGE_RATIO)
 EFFECT_MOSAIC = "모자이크"
 EFFECT_BLUR = "블러"
 EFFECTS = [EFFECT_MOSAIC, EFFECT_BLUR]
-BLUR_SIGMA_RATIO = 0.2     # 블러 세기: 가림 영역 긴 변의 몇 배를 가우시안 시그마로 쓸지 (클수록 흐려진다)
-BLUR_EDGE_RATIO = 0.06     # 블러 영역 가장자리를 부드럽게 섞는 폭 (짧은 변 대비 비율)
 
 # 얼굴 신뢰도(conf)가 이 값보다 낮으면 "얼굴이 아닐 수 있다"는 경고를 보여 준다. (탐지 임계값 CONF 0.15 보다 높게)
 # TODO: 위와 같이 팀에 알린 뒤 config.py 로 옮긴다.
@@ -257,9 +257,9 @@ footer { visibility: hidden; }
     font-size: clamp(2.6rem, 8vw, 5.4rem); font-weight: 800; line-height: 1.14; letter-spacing: -.03em;
 }
 .landing-title mark { background: linear-gradient(transparent 62%, var(--mint) 62%); color: inherit; padding: 0 .08em; }
-.landing.compact .landing-title { font-size: clamp(1.9rem, 4.6vw, 2.8rem); }
 .landing-tip { position: relative; max-width: 38rem; margin: .8rem 0 0; color: var(--muted); font-size: .92rem; line-height: 1.6; word-break: keep-all; text-wrap: balance; opacity: .9; }
 .landing-desc { position: relative; max-width: 38rem; margin: 0; word-break: keep-all !important; overflow-wrap: normal !important; text-wrap: balance; color: var(--muted); line-height: 1.7; font-size: clamp(1rem, 2.2vw, 1.2rem); }
+.landing.compact .landing-title { font-size: clamp(1.9rem, 4.6vw, 2.8rem); }
 .scroll-hint {
     position: absolute; bottom: 6.5rem; left: 0; right: 0;
     display: flex; flex-direction: column; align-items: center; gap: .3rem;
@@ -319,7 +319,7 @@ footer { visibility: hidden; }
 .stButton > button:focus:not(:active),
 [data-testid="stDownloadButton"] button:focus:not(:active) { border: none; box-shadow: 0 0 0 3px rgba(159, 217, 194, 0.55); }
 .stButton > button:disabled,
-[data-testid="stDownloadButton"] button:disabled { opacity: .35; cursor: not-allowed; }   /* 누를 수 없는 버튼은 흐리게 */
+[data-testid="stDownloadButton"] button:disabled { background: var(--ink) !important; border: none !important; opacity: .35; cursor: not-allowed; }   /* 누를 수 없는 버튼은 같은 색에서 흐리게 (배경을 지정하지 않으면 흰 카드 위에서 사라진다) */
 
 /* 비교 카드 머리줄: 제목은 왼쪽, 버튼(결과 저장 · 적용)은 오른쪽 끝에 붙인다 */
 [class*="st-key-result_head"] .card-desc { margin-bottom: 0; }
@@ -374,6 +374,9 @@ footer { visibility: hidden; }
 [class*="st-key-pick_on_"] .stButton > button * { color: var(--select-ink) !important; font-weight: 700; }
 [class*="st-key-pick_on_"] .stButton > button:hover { background: var(--select); border: 1px solid transparent; filter: brightness(.96); }
 [class*="st-key-pick_off_"] .stButton, [class*="st-key-pick_on_"] .stButton { margin-top: .2rem; }
+/* 실시간 처리 중에는 등록 태그가 막힌다: 막힌 버튼의 공통 모양(검정)이 태그 색을 덮지 않게 태그 색을 그대로 두고 흐리게만 한다 */
+[class*="st-key-pick_off_"] .stButton > button:disabled { background: var(--mint-soft) !important; border: 1px solid var(--mint-line) !important; }
+[class*="st-key-pick_on_"] .stButton > button:disabled { background: var(--select) !important; }
 
 /* 인물 등록 카드: 등록된 인물 줄(작은 사진 + 태그 + 해제 버튼)과 맨 아래의 '등록 인물 제외' 스위치 */
 /* 등록된 사람들 줄: 태그 · 작은 사진들 · 등록 해제 버튼이 한 줄에 가지런히 놓이고, 좁아지면 줄만 바뀐다 */
@@ -416,9 +419,42 @@ footer { visibility: hidden; }
 .step.done { background: var(--mint); color: var(--ink); border-color: var(--mint); }
 .step.now { background: var(--select); color: var(--select-ink); border-color: transparent; font-weight: 700; }
 .steps-note { color: var(--muted); font-size: .85rem; margin: 0 0 1.4rem; }
+/* 얼굴 후보를 찾는 동안의 표시: 작은 회전 표시 + 글자 */
+.finding { display: flex; align-items: center; gap: .6rem; color: var(--muted); font-size: .9rem; margin: .8rem 0 .4rem; }
+.finding::before { content: ""; width: 1rem; height: 1rem; border: 2px solid var(--line); border-top-color: var(--ink); border-radius: 50%; animation: finding-spin .8s linear infinite; }
+@keyframes finding-spin { to { transform: rotate(360deg); } }
 
 /* 결과 파일 정보 · 개인정보 안내: 작은 회색 글씨 */
 .result-info { color: var(--muted); font-size: .85rem; line-height: 1.7; margin-top: .8rem; word-break: keep-all; }
+/* 실시간 주소 입력칸: 옆의 [등록] 버튼과 높이(43px) · 모서리(알약) · 좌우 여백(24px) · 글자 크기를 똑같이 맞춘다. 배경 · 점선 테두리는 업로드 박스(dropzone)와 같다.
+   카드 폭에 맞추고(Streamlit 이 잡은 고정 폭을 풀고), 글자는 왼쪽 정렬 · 박스 높이의 수직 가운데에 둔다. */
+[class*="st-key-card_upload"] [data-testid="stTextInput"] { width: 100% !important; max-width: 100% !important; box-sizing: border-box; }
+[class*="st-key-card_upload"] [data-testid="stTextInput"] [data-baseweb="input"] {
+    width: 100%; height: 43px; min-height: 43px; box-sizing: border-box; display: flex; align-items: center;
+    background: var(--mint-soft) !important; border: 1px dashed var(--mint-line) !important; border-radius: 999px;
+}
+[class*="st-key-card_upload"] [data-testid="stTextInput"] [data-baseweb="base-input"] {
+    width: 100%; height: 100%; display: flex; align-items: center; background: transparent !important; border: none !important; border-radius: 999px;
+}
+[class*="st-key-card_upload"] [data-testid="stTextInput"] input {
+    height: 100%; box-sizing: border-box; padding: 0 24px !important; text-align: left; line-height: normal;
+    background: transparent !important; color: var(--ink); font-size: 1rem;
+}
+[class*="st-key-card_upload"] [data-testid="stTextInput"] input::placeholder { color: var(--muted); opacity: 1; }
+[class*="st-key-card_upload"] [data-testid="stTextInput"] [data-baseweb="input"]:focus-within { border-color: var(--ink) !important; }
+[data-testid="InputInstructions"] { display: none; }   /* 'Press Enter to apply' 는 박스 안 글자의 수직 가운데를 깨므로 숨긴다 */
+/* 실시간 주소 입력칸 옆 [등록] 버튼(폼 제출 버튼): 폼의 테두리·여백은 없애고, 버튼은 파일 선택(Browse files)과 같은 검정 알약. 입력 박스와 같은 높이(43px)라 아래 끝이 그대로 맞는다 */
+[class*="st-key-stream_url_row"] [data-testid="stForm"] { border: none; padding: 0; }
+[class*="st-key-stream_url_row"] [data-testid="stFormSubmitButton"] button {
+    height: 43px; min-height: 43px; box-sizing: border-box;
+    background: var(--ink); color: #fff !important; border: none; border-radius: 999px; padding: 0 1.5rem; font-weight: 600; transition: background .15s;
+}
+[class*="st-key-stream_url_row"] [data-testid="stFormSubmitButton"] button * { color: #fff !important; }
+[class*="st-key-stream_url_row"] [data-testid="stFormSubmitButton"] button p { font-weight: 600; }
+[class*="st-key-stream_url_row"] [data-testid="stFormSubmitButton"] button:hover { background: var(--ink-soft); border: none; }
+/* 실시간 주소: [실시간 시작] · [정지]는 파일 선택(Browse files) 버튼과 같은 모양으로 가운데에 */
+[class*="st-key-stream_start"] { display: flex; justify-content: center; }
+[class*="st-key-stream_start"] .stButton { display: flex; justify-content: center; }
 .result-info code { background: var(--line); color: var(--ink); padding: .05rem .4rem; border-radius: 6px; font-size: .82em; }
 .privacy-note {
     max-width: 40rem; margin: 3rem auto 0; text-align: center;
@@ -518,6 +554,7 @@ html:is([data-tone="register"], [data-tone="work"]) [class*="st-key-bottom_bar"]
     [class*="st-key-bottom_bar"]::before { width: 3.2rem; height: 1.6rem; }
     [class*="st-key-bottom_bar"] label[data-baseweb="radio"] { padding: .5rem .9rem; font-size: .85rem; }
 }
+
 </style>
 """
 
@@ -579,14 +616,15 @@ def get_queue() -> TicketQueue:
 
 
 @contextmanager
-def processing_slot(on_wait: Optional[Callable[[int], None]] = None, wait: bool = True) -> Iterator[None]:
+def processing_slot(on_wait: Optional[Callable[[int], None]] = None, wait: bool = True, queue: Optional["TicketQueue"] = None) -> Iterator[None]:
     """처리 자리를 하나 잡는다. 차례가 올 때까지 기다리며, 기다리는 동안 on_wait(대기 순번)을 부른다.
 
     wait=False 이면 기다리지 않고, 자리가 없을 때 바로 BusyError 를 낸다. (끝이 없는 실시간 처리용)
     `with processing_slot():` 블록이 끝나면 오류가 나도, 사용자가 취소해도 자리를 반드시 반납한다.
     on_wait 안에서 st.xxx 를 부르면, 취소 버튼을 눌렀을 때 Streamlit 이 이 대기를 끊어 준다.
+    queue 는 화면 스크립트 밖(스레드)에서 부를 때 미리 get_queue() 로 얻어 넘기는 대기열이다.
     """
-    queue = get_queue()
+    queue = queue if queue is not None else get_queue()
     ticket = queue.join()
     try:
         while not queue.try_start(ticket):
@@ -615,6 +653,12 @@ def init_session_state() -> None:
     st.session_state.setdefault("video_result", None)     # 영상 처리 결과 {"key", "path", "info", "audio", "codec", "effect"}
     st.session_state.setdefault("metrics", [])            # 성능 지표 기록 (이 접속에서 처리한 것)
     st.session_state.setdefault("run_counter", 0)         # 처리를 시작할 때마다 1씩 올려, 얼굴 선택 칸을 새로 만든다
+    st.session_state.setdefault("cand_job", None)         # 백그라운드로 도는 얼굴 후보 찾기 {"future", "source_id"}
+    st.session_state.setdefault("cand_error", None)       # 후보 찾기가 실패했을 때의 안내 (종류, 내용)
+    st.session_state.setdefault("live", None)             # 실시간 처리 하나 (LiveJob). 화면이 다시 그려져도 스레드로 계속 돈다
+    st.session_state.setdefault("live_last", None)        # 끝난 실시간 처리의 마지막 화면 (원본·결과 프레임, 정보)
+    st.session_state.setdefault("live_error", None)       # 실시간 처리가 오류로 끝났을 때의 안내 (종류, 내용)
+    st.session_state.setdefault("video_edit", None)       # 영상 편집 상태 (처리한 영상의 박스·사람별 해제/가림·직접 영역). 사진의 image_results 와 같은 역할
 
 
 def get_workdir() -> Path:
@@ -743,9 +787,13 @@ def active_ref() -> Optional[np.ndarray]:
 
 
 def ref_tag() -> int:
-    """제외 인물 설정이 바뀌었는지 알아보는 표식. 등록이 없으면 0, 있으면 그 벡터 객체의 id. (등록·해제할 때마다 새 객체가 만들어진다)"""
-    ref = active_ref()
-    return 0 if ref is None else id(ref)
+    """제외 인물 설정이 바뀌었는지 알아보는 표식. 등록한 사람이 없으면 0, 있으면 그 사람들의 열쇠로 만든 값.
+
+    사진·영상 화면에서 얼굴을 클릭해 제외하면서 자동으로 올라간 사람(origin == "pick")은 세지 않는다. 그 사람이 등록되는 순간
+    지금 보고 있는 결과(편집 중인 사진·영상)가 '이전 설정의 결과'로 바뀌어 사라지면 안 되기 때문이다. 다음에 처리할 때는 active_ref 에 포함된다.
+    """
+    keys = sorted(str(key) for key, person in st.session_state["ref_people"].items() if person.get("origin") != "pick")
+    return 0 if not keys else hash(tuple(keys))
 
 
 def render_steps(box: object, names: list[str], current: int, note: str = "") -> None:
@@ -785,31 +833,10 @@ def format_size(num_bytes: int) -> str:
 
 
 def apply_blur(img: np.ndarray, boxes: list[dict], pad: float = PAD) -> np.ndarray:
-    """BGR 이미지의 얼굴 박스에 부드러운 블러를 씌운 새 이미지를 돌려준다. 입력 이미지는 바꾸지 않는다.
+    """BGR 이미지의 얼굴 박스에 부드러운 블러를 씌운 새 이미지를 돌려준다. 본체는 src/mosaic.py 의 apply_blur (영상과 같은 코드)."""
+    from src.mosaic import apply_blur as _apply_blur
 
-    apply_mosaic 과 같은 방식으로 박스에 pad 비율만큼 여백을 더하고 이미지 범위로 자른다.
-    영역은 타원이고, 가장자리는 서서히 섞어서 경계선이 티 나지 않게 한다.
-    (B파트 mosaic.py 는 건드리지 않으려고 화면 쪽에 둔 함수다. 영상은 아직 지원하지 않는다.)
-    """
-    out = img.copy()
-    img_h, img_w = img.shape[:2]
-    for box in boxes:
-        x1, y1, x2, y2 = box["xyxy"]
-        px, py = (x2 - x1) * pad, (y2 - y1) * pad
-        x1, y1 = max(math.floor(x1 - px), 0), max(math.floor(y1 - py), 0)
-        x2, y2 = min(math.ceil(x2 + px), img_w), min(math.ceil(y2 + py), img_h)
-        if x2 <= x1 or y2 <= y1:
-            continue
-
-        roi = out[y1:y2, x1:x2]    # out 의 뷰라서 쓰면 out 에 반영된다
-        h, w = roi.shape[:2]
-        blurred = cv2.GaussianBlur(roi, (0, 0), max(w, h) * BLUR_SIGMA_RATIO)
-
-        mask = np.zeros((h, w), np.float32)
-        cv2.ellipse(mask, (w // 2, h // 2), (w // 2, h // 2), 0, 0, 360, 1.0, -1)
-        mask = cv2.GaussianBlur(mask, (0, 0), max(1.0, min(w, h) * BLUR_EDGE_RATIO))[..., None]
-        roi[:] = (roi * (1.0 - mask) + blurred * mask).astype(np.uint8)
-    return out
+    return _apply_blur(img, boxes, pad)
 
 
 def mark_cancelled() -> None:
@@ -1075,12 +1102,14 @@ def face_picker_boxes(
     manual: list[list[int]],
     reset_excluded: list[int],
     token: str,
+    ids: Optional[list[int]] = None,
 ) -> Optional[dict]:
     """사진·영상 프레임 위에서 얼굴을 클릭해 제외하고, 직접 영역을 그리는 컴포넌트를 보여 준다.
 
     src 는 미리보기 data URL, image_shape 는 원본 (높이, 너비), detected 는 탐지 박스 목록(원본 픽셀),
     excluded 는 처음부터 제외로 표시할 detected 번호, manual 은 이미 있는 직접 영역(원본 픽셀),
     reset_excluded 는 '초기화'를 눌렀을 때 돌아갈 제외 목록, token 은 이 값이 바뀌면 컴포넌트를 처음부터 다시 그린다.
+    ids 는 detected 각 박스의 번호(없으면 0, 1, 2...). excluded·reset_excluded·반환값의 번호는 모두 이 번호다. (영상은 사람 번호를 넘긴다)
     반환: 사용자가 만지기 전에는 None, 만진 뒤에는 {"excluded": [번호...], "manual": [[x1,y1,x2,y2]...]} (캔버스 좌표).
     """
     h, w = image_shape
@@ -1088,7 +1117,7 @@ def face_picker_boxes(
     boxes = []
     for i, b in enumerate(detected):
         x1, y1, x2, y2 = to_canvas_box(b["xyxy"], w, h)
-        boxes.append({"id": i, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "conf": b["conf"], "auto": b.get("auto_excluded", False)})
+        boxes.append({"id": ids[i] if ids is not None else i, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "conf": b["conf"], "auto": b.get("auto_excluded", False)})
     manual_canvas = [list(to_canvas_box(tuple(m), w, h)) for m in manual]
     return _face_picker(
         mode="boxes", cw=lay["cw"], ch=lay["ch"], img={"src": src, "x": lay["x"], "y": lay["y"], "w": lay["w"], "h": lay["h"]},
@@ -1136,10 +1165,92 @@ def on_register(files: list[UploadedFile]) -> list[dict]:
     # ┌─────────────────────────────────────────────┐
     # │ [C파트 모듈] src/exclude.py : list_candidates │
     # └─────────────────────────────────────────────┘
+    paths = [save_upload_to_temp(f, f"register_{i}") for i, f in enumerate(files)]
+    return find_candidates(paths)
+
+
+def find_candidates(paths: list[str]) -> list[dict]:
+    """저장해 둔 파일 경로들에서 얼굴 후보를 찾는다. st.xxx 를 쓰지 않아서 화면 스크립트와 다른 스레드에서 불러도 된다."""
     from src.exclude import list_candidates
 
-    paths = [save_upload_to_temp(f, f"register_{i}") for i, f in enumerate(files)]
     return list_candidates(paths[0] if len(paths) == 1 else paths)
+
+
+@st.cache_resource
+def get_job_executor() -> ThreadPoolExecutor:
+    """오래 걸리는 일(얼굴 후보 찾기)을 화면 스크립트와 따로 돌리는 일꾼. 한 번에 하나만 돌려 모델을 겹쳐 쓰지 않는다. (서버에 하나)"""
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="triple-y-job")
+
+
+def candidate_job_pending() -> bool:
+    """얼굴 후보를 찾는 일이 아직 돌고 있는지."""
+    job = st.session_state.get("cand_job")
+    return job is not None and not job["future"].done()
+
+
+def start_candidate_job(sources: list[UploadedFile], source_id: str) -> None:
+    """얼굴 후보 찾기를 백그라운드에서 시작한다. 이미 돌고 있으면 새로 시작하지 않는다.
+
+    Streamlit 은 위젯을 건드리면(예: 아래의 모자이크/블러 전환) 실행 중이던 스크립트를 중단한다. 후보 찾기를 스크립트 안에서 하면 그때 결과가 사라지므로,
+    스크립트와 상관없이 도는 스레드에 맡기고 화면은 끝났는지만 본다. 스레드는 st.session_state 를 쓸 수 없어서 파일 저장은 여기서 미리 한다.
+    """
+    if candidate_job_pending():
+        return
+    paths = [save_upload_to_temp(f, f"register_{i}") for i, f in enumerate(sources)]
+    st.session_state["cand_job"] = {"future": get_job_executor().submit(find_candidates, paths), "source_id": source_id}
+    st.session_state["candidates"] = None
+    st.session_state["cand_error"] = None
+
+
+def start_stream_candidate_job(url: str, source_id: str) -> None:
+    """실시간 주소에서 장면을 자동 캡처해 얼굴 후보를 찾는 일을 백그라운드에서 시작한다. (start_candidate_job 과 같은 방식)"""
+    if candidate_job_pending():
+        return
+    job = get_job_executor().submit(find_stream_candidates, url, str(get_workdir() / "stream_sample"))
+    st.session_state["cand_job"] = {"future": job, "source_id": source_id}
+    st.session_state["candidates"] = None
+    st.session_state["cand_error"] = None
+
+
+def settle_candidate_job(source_id: str) -> None:
+    """끝난 후보 찾기가 있으면 결과를 반영한다. 그 사이에 다른 파일로 바뀌었으면 결과는 버린다. 오류는 cand_error 에 남겨 계속 보여 준다."""
+    job = st.session_state.get("cand_job")
+    if job is None or not job["future"].done():
+        return
+    st.session_state["cand_job"] = None
+    err = job["future"].exception()
+    if err is None:
+        if job["source_id"] == source_id:
+            st.session_state["candidates"] = job["future"].result()
+            st.session_state["candidates_for"] = source_id
+    elif isinstance(err, ImportError):
+        st.session_state["cand_error"] = ("module", err)
+    elif isinstance(err, (ValueError, OSError, RuntimeError)):    # 파일을 읽을 수 없음 · 모델 내려받기 실패 · 인식 엔진 오류
+        st.session_state["cand_error"] = ("text", f"얼굴 후보를 찾지 못했습니다: {err}")
+    else:
+        raise err
+    request_scroll("person")    # 후보가 보이도록 이 카드의 아래쪽으로 내려간다
+
+
+@st.fragment(run_every=1.0)
+def poll_candidate_job() -> None:
+    """후보 찾기가 끝났는지 1초마다 보고, 끝나면 화면 전체를 다시 그려 결과를 보여 준다. (돌고 있을 때만 화면에 둔다)"""
+    job = st.session_state.get("cand_job")
+    if job is not None and job["future"].done():
+        st.rerun()
+
+
+def render_candidate_loading() -> None:
+    """후보를 찾는 동안의 '찾는 중' 표시와, 끝난 뒤 남은 오류 안내."""
+    if candidate_job_pending():
+        st.markdown('<div class="finding">얼굴을 찾는 중...</div>', unsafe_allow_html=True)
+        poll_candidate_job()
+    error = st.session_state.get("cand_error")
+    if error is not None:
+        if error[0] == "module":
+            show_module_missing(error[1])
+        else:
+            st.error(error[1])
 
 
 def box_iou(a: tuple, b: tuple) -> float:
@@ -1371,9 +1482,9 @@ def on_video(
         from src.video import process_video
 
         if "effect" in inspect.signature(process_video).parameters:
-            extra_kwargs["effect"] = effect
-        elif effect != EFFECT_MOSAIC:    # 조용히 모자이크로 바꾸지 않고 알려 준다
-            raise ValueError("영상 처리 모듈(process_video)이 아직 블러를 지원하지 않습니다. 모자이크를 고르거나, 조영준(B)에게 effect 인자 추가를 요청해 주세요.")
+            extra_kwargs["effect"] = "blur" if effect == EFFECT_BLUR else "mosaic"
+        elif effect != EFFECT_MOSAIC:    # effect 를 모르는 옛 process_video 면 블러는 웹 데모용 처리 함수가 대신한다
+            process_video, extra_kwargs = process_video_demo, {"effect": effect}
     else:
         process_video = process_video_demo
         extra_kwargs["effect"] = effect
@@ -1384,20 +1495,93 @@ def on_video(
     return out_path, info
 
 
-def on_stream(url: str, ref_embs: Optional[np.ndarray]) -> Iterator[tuple[np.ndarray, dict]]:
-    """실시간 주소(RTSP·유튜브 라이브 등)를 모자이크하며 (RGB 프레임, 정보 dict)를 계속 내보낸다.
+def on_video_edit(
+    video_path: str,
+    ref_embs: Optional[np.ndarray],
+    on_progress: Optional[Callable[[float], None]] = None,
+    effect: str = EFFECT_MOSAIC,
+    on_wait: Optional[Callable[[int], None]] = None,
+) -> tuple[str, dict, Optional[object]]:
+    """on_video 와 같지만, 결과를 다시 만들 때 쓰는 VideoAnalysis 도 함께 돌려준다: (결과 영상 경로, 정보 dict, VideoAnalysis 또는 None).
 
-    정보 dict: {"faces_now": 현재 인원, "faces_total": 누적 인원, "fps": 처리 속도}
-    끝이 없는 처리라 대기열에서 기다리지 않고, 자리가 없으면 바로 BusyError 를 낸다.
+    src/video.py 에 process_video_edit 가 없으면(옛 모듈) on_video 로 처리하고 VideoAnalysis 는 None 이라 영상 편집을 쓰지 못한다.
+    """
+    check_video_limits(video_path)
+    if module_exists("src.video"):
+        import src.video as video_module
+
+        if hasattr(video_module, "process_video_edit"):
+            out_path = str(Path(video_path).with_name(Path(video_path).stem + "_out.mp4"))
+            with processing_slot(on_wait):
+                info, analysis = video_module.process_video_edit(
+                    video_path, out_path, ref_embs=ref_embs, on_progress=on_progress,
+                    effect="blur" if effect == EFFECT_BLUR else "mosaic",
+                )
+            return out_path, info, analysis
+    out_path, info = on_video(video_path, ref_embs, on_progress=on_progress, effect=effect, on_wait=on_wait)
+    return out_path, info, None
+
+
+def on_video_rerender(
+    video_path: str,
+    analysis: object,
+    effect: str,
+    unmask: frozenset,
+    mask: frozenset,
+    regions: tuple,
+    version: int,
+    on_progress: Optional[Callable[[float], None]] = None,
+    on_wait: Optional[Callable[[int], None]] = None,
+) -> tuple[str, dict]:
+    """이미 처리한 영상을 얼굴을 다시 찾지 않고 편집 내용(해제·다시 가림·직접 영역)과 가리는 방식대로 다시 만든다. (결과 영상 경로, 정보 dict)
+
+    version 은 결과 파일 이름에 붙여, 브라우저가 재생 중인 이전 결과를 덮어쓰지 않게 한다.
+    """
+    from src.video import render_video
+
+    out_path = str(Path(video_path).with_name(f"{Path(video_path).stem}_out{version}.mp4"))
+    with processing_slot(on_wait):
+        info = render_video(
+            video_path, out_path, analysis, effect="blur" if effect == EFFECT_BLUR else "mosaic",
+            unmask=unmask, mask=mask, regions=regions, on_progress=on_progress,
+        )
+    return out_path, info
+
+
+def on_stream(
+    url: str,
+    ref_embs: Optional[np.ndarray],
+    effect: object = EFFECT_MOSAIC,
+    queue: Optional["TicketQueue"] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> Iterator[tuple[np.ndarray, dict]]:
+    """실시간 주소(RTSP·유튜브 라이브 등)를 모자이크(또는 블러)하며 (결과 RGB 프레임, 정보 dict)를 계속 내보낸다.
+
+    정보 dict: {"faces_now": 현재 인원, "faces_total": 누적 인원, "fps": 처리 속도, "original_rgb": 가리기 전 원본 RGB 프레임}
+    effect 는 가리는 방식("모자이크"/"블러")이거나 그것을 돌려주는 함수다. 함수면 프레임마다 다시 물어서, 도는 중에도 방식을 바꿀 수 있다.
+    끝이 없는 처리라 대기열에서 기다리지 않고, 자리가 없으면 바로 BusyError 를 낸다. 스레드에서 부를 때는 queue 를 넘긴다.
     """
     # ┌────────────────────────────────────────────┐
     # │ [B파트 모듈] src/stream.py : process_stream  │
     # └────────────────────────────────────────────┘
     from src.stream import process_stream
 
-    with processing_slot(wait=False):
-        for frame_bgr, info in process_stream(url, ref_embs=ref_embs):
+    def effect_name() -> str:
+        return "blur" if (effect() if callable(effect) else effect) == EFFECT_BLUR else "mosaic"
+
+    with processing_slot(wait=False, queue=queue):
+        for frame_bgr, info in process_stream(url, ref_embs=ref_embs, effect=effect_name, should_stop=should_stop):
+            info = dict(info)
+            original = info.pop("original", None)
+            info["original_rgb"] = cv2.cvtColor(original, cv2.COLOR_BGR2RGB) if original is not None else None
             yield cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB), info
+
+
+def find_stream_candidates(url: str, folder: str) -> list[dict]:
+    """실시간 주소에서 장면 몇 장을 미리 떼어 보고 그 속의 얼굴 후보를 찾는다. st.xxx 를 쓰지 않아 다른 스레드에서 불러도 된다."""
+    from src.stream import sample_stream_frames
+
+    return find_candidates(sample_stream_frames(url, folder))
 
 
 # ============================================================
@@ -1574,7 +1758,6 @@ def inject_paging_script() -> None:
         height=0,
     )
 
-
 def render_metrics_card() -> None:
     """[메인] 아래쪽 '성능 지표' 카드: 이 접속에서 처리한 기록의 요약 수치와 최근 기록 표를 보여 준다."""
     with st.container(key="card_metrics"):
@@ -1630,10 +1813,87 @@ def get_modes() -> list[str]:
     return [MODE_IMAGE, MODE_VIDEO] + ([MODE_STREAM] if SHOW_STREAM_MODE else [])
 
 
-def render_file_tab() -> None:
-    """처리 종류 전환 버튼(+ 바로 아래 파일 선택) -> (파일을 올린 뒤에만) 인물 등록 카드 -> 원본·결과 비교 카드 순서로 보여 준다.
+def pick_person(key: tuple, cand: Optional[dict]) -> bool:
+    """클릭해 제외한 얼굴을 인물 등록에 올린다. 올렸으면 True. cand 가 None(벡터를 못 만듦)이면 아무것도 안 한다."""
+    if cand is None:
+        return False
+    st.session_state["ref_people"][key] = {"embs": cand["embs"], "thumb": cv2.cvtColor(cand["thumb"], cv2.COLOR_BGR2RGB), "origin": "pick"}
+    return True
 
-    파일 선택 칸은 항상 업로드 카드의 사진/영상 전환 버튼 바로 아래에 있다. 파일을 올리기 전에는 점선 상자로,
+
+def sync_pick_registrations(mode: str, files: list[UploadedFile]) -> None:
+    """사진·영상 화면에서 얼굴을 클릭해 제외하면 그 사람을 인물 등록에도 '등록됨'으로 올리고, 다시 가림으로 돌리면 내린다.
+
+    인물 등록 카드를 그리기 전에 불러서, 클릭한 바로 그 화면에서 등록 상태가 같이 바뀌게 한다. 처음부터 등록 인물이라 자동 제외된 얼굴은
+    건드리지 않는다. 올린 사람은 origin == "pick" 이고, 다음에 처리할 때부터 자동으로 제외된다. 작은 얼굴이나 옆얼굴처럼 믿을 만한 벡터를
+    못 만드는 얼굴은 그 장면에서만 제외되고 등록되지 않는다. (src/exclude.py 의 embed_face)
+    """
+    from src.exclude import embed_face
+
+    people = st.session_state["ref_people"]
+    failed: set = st.session_state.setdefault("pick_failed", set())    # 벡터를 못 만든 얼굴은 화면을 다시 그릴 때마다 시도하지 않는다
+    changed = False
+
+    def settle(key: tuple, wanted: bool, make: Callable[[], Optional[dict]]) -> None:
+        nonlocal changed
+        if wanted and key not in people and key not in failed:
+            if pick_person(key, make()):
+                changed = True
+            else:
+                failed.add(key)
+        elif not wanted:
+            failed.discard(key)
+            if key in people and people[key].get("origin") == "pick":
+                del people[key]
+                changed = True
+
+    if mode == MODE_IMAGE:
+        by_id = {f.file_id: f for f in files}
+        for entry in st.session_state["image_results"].values():
+            uploaded = by_id.get(entry["fid"])
+            if uploaded is None:
+                continue
+            parsed = parse_edit(st.session_state.get(picker_key(entry)), entry["edit"], set(range(len(entry["detected"]))), entry["src_size"])
+            chosen, auto = set(parsed["excluded"]), set(entry["init_edit"]["excluded"])
+            for i, box in enumerate(entry["detected"]):
+                if i in auto:
+                    continue
+                xyxy = tuple(int(v) for v in box["xyxy"])
+                settle(("pick", entry["fid"], xyxy), i in chosen,
+                       lambda uploaded=uploaded, xyxy=xyxy: embed_face(cv2.cvtColor(decode_image_rgb(uploaded), cv2.COLOR_RGB2BGR), xyxy))
+    elif files:
+        edit = current_video_edit(files[0])
+        if edit is not None and edit["pargs"] is not None:
+            view = edit["pargs"]
+            for person, detected, auto in zip(view["ids"], view["detected"], view["autos"]):
+                if auto:
+                    continue
+                xyxy = tuple(int(v) for v in detected["xyxy"])
+                settle(("pickv", files[0].file_id, person), edit["decision"].get(person) == "unmask",
+                       lambda xyxy=xyxy, frame=view["frame"]: embed_face(read_video_frame_bgr(files[0], frame), xyxy))
+    if changed:
+        sync_ref_embs()
+
+
+def read_video_frame_bgr(uploaded: UploadedFile, frame_idx: int) -> np.ndarray:
+    """업로드한 영상(이 접속의 임시 폴더에 저장된 입력 파일)의 frame_idx 번째 프레임(BGR)."""
+    cap = cv2.VideoCapture(str(get_workdir() / f"input{Path(uploaded.name).suffix.lower()}"))
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, frame = cap.read()
+    finally:
+        cap.release()
+    if not ok:
+        raise ValueError("영상에서 이 장면을 읽을 수 없습니다.")
+    return frame
+
+
+def render_file_tab() -> None:
+    """처리 종류 전환 버튼(+ 바로 아래 파일 선택·주소 입력) -> 인물 등록 카드 -> 결과 카드 순서로 보여 준다. 종류마다 갈래가 하나씩이다.
+
+    - 사진 · 영상: 업로드 칸 -> 인물 등록 카드 -> (파일을 올린 뒤) 원본·결과 비교 카드. 파일을 올리기 전에는 인물 등록 카드를 보이지 않는다.
+    - 실시간 주소: 주소 입력칸 -> 인물 등록 카드 -> 가리는 방식 · 실시간 시작 카드. 주소를 입력하기 전에는 입력칸만 보이고, 입력한 뒤에 두 카드가 나타난다.
+    파일 선택 칸은 항상 업로드 카드의 전환 버튼 바로 아래에 있다. 파일을 올리기 전에는 점선 상자로,
     올린 뒤에는 가운데의 작은 Browse files 버튼(과 파일 이름)으로 줄어든다.
     """
     mode = st.session_state.get("mode", MODE_IMAGE)    # 아래 라디오가 만들어지기 전에도 현재 값을 알아야 한다
@@ -1652,21 +1912,33 @@ def render_file_tab() -> None:
         with st.container(key="mode_picker"):
             mode = st.radio("처리 종류", get_modes(), key="mode", horizontal=True, label_visibility="collapsed")
 
+        url = ""
         if mode == MODE_STREAM:
-            render_stream()
+            url = render_stream_url()
+        else:
+            with st.container(key="result_uploader" if has_files else "upload_full"):    # 올린 뒤에는 CSS 가 작은 버튼으로 줄인다
+                render_uploader(mode)
+            if not has_files:
+                st.caption("파일을 올리면 아래에 원본과 모자이크 결과가 나란히 표시됩니다.")
+
+    # 카드 3 · 4: 종류에 맞는 갈래 하나만 그린다.
+    if mode == MODE_STREAM:
+        if url:    # 주소를 등록(입력 후 [등록])하기 전에는 입력칸만 보인다. 확인한 뒤에 인물 등록 카드와 원본·결과 비교 카드가 나타난다
+            render_stream_person_card(url)
+            with st.container(key="card_result"):
+                render_stream_compare(url)
+        else:
+            stop_live()    # 주소가 없어지면(입력칸을 고침) 돌고 있던 처리를 멈춘다
+    else:    # MODE_IMAGE · MODE_VIDEO
+        stop_live()    # 사진·영상으로 옮겨 오면 돌고 있던 실시간 처리를 멈춘다
+        if not has_files:    # 파일을 고르기 전에는 '인물 등록' 박스를 아예 보이지 않는다 (후보를 찾을 파일이 없으니 쓸 수 없다)
             return
-
-        with st.container(key="result_uploader" if has_files else "upload_full"):    # 올린 뒤에는 CSS 가 작은 버튼으로 줄인다
-            render_uploader(mode)
-        if not has_files:
-            st.caption("파일을 올리면 아래에 원본과 모자이크 결과가 나란히 표시됩니다.")
-    if not has_files:    # 파일을 고르기 전에는 '인물 등록' 박스를 아예 보이지 않는다 (후보를 찾을 파일이 없으니 쓸 수 없다)
-        return
-    render_person_card(mode, files)    # 업로드 박스 바로 아래: 인물 관련 UI 는 이 카드 하나에 모여 있다
-
-    # 카드 3 (하단): 원본과 결과 비교.
-    with st.container(key="card_result"):
-        render_result_card(mode, files)
+        if mode == MODE_VIDEO:
+            sync_video_edits(files[0])    # 영상 프레임에서 클릭한 내용을 먼저 편집 상태에 옮긴다 (아래 인물 등록 연동과 적용이 최신 값을 쓰게)
+        sync_pick_registrations(mode, files)    # 사진·영상에서 클릭해 제외한 얼굴을 인물 등록에도 올린다 (카드를 그리기 전에 해야 같은 화면에 바로 보인다)
+        render_person_card(mode, files)    # 업로드 박스 바로 아래: 인물 관련 UI 는 이 카드 하나에 모여 있다
+        with st.container(key="card_result"):    # 원본과 결과 비교
+            render_result_card(mode, files)
 
 
 def render_uploader(mode: str) -> None:
@@ -1975,15 +2247,123 @@ def render_image_rows(entries: list[tuple[UploadedFile, np.ndarray]], effect: st
 # 영상
 # ------------------------------------------------------------
 
-def run_video(uploaded: UploadedFile, ui: JobUI) -> None:
-    """영상을 on_video 로 처리하면서 진행률 막대와 단계 표시줄을 갱신하고, 결과를 session_state 에 남긴다.
+def video_edit_key(uploaded: UploadedFile) -> str:
+    """영상 편집 상태가 맞는 영상인지 보는 열쇠. 파일이나 제외 인물 설정이 바뀌면 다시 처리해야 하므로 다른 열쇠가 된다. (가리는 방식은 바로 바꿀 수 있어 뺀다)"""
+    return f"{uploaded.file_id}|{ref_tag()}"
 
+
+def current_video_edit(uploaded: UploadedFile) -> Optional[dict]:
+    """지금 올린 영상·등록 인물에 맞는 편집 상태를 돌려준다. 아직 처리하지 않았거나 설정이 바뀌었으면 None."""
+    edit = st.session_state.get("video_edit")
+    return edit if edit is not None and edit["akey"] == video_edit_key(uploaded) else None
+
+
+def new_video_edit(uploaded: UploadedFile, analysis: object, run_id: int) -> dict:
+    """처음 처리한 영상의 편집 상태를 만든다. 처음 보여 줄 장면은 사람이 가장 많이 잡힌 프레임이다."""
+    counts = [sum(1 for box in boxes if box["track_id"] is not None) for boxes in analysis.boxes]
+    frame = max(range(len(counts)), key=counts.__getitem__) if counts else 0
+    st.session_state["video_frame"] = frame    # 얼굴 선택 화면에 보여 줄 프레임 번호 (슬라이더는 없앴다)
+    return {
+        "akey": video_edit_key(uploaded), "analysis": analysis, "run": run_id, "version": 0, "render": 0,
+        "decision": {},      # 사람 번호 -> "unmask"(해제) | "mask"(등록 인물이어도 가림). 기본 규칙과 같게 되돌리면 지운다
+        "manual": [],        # 직접 영역 [[x1, y1, x2, y2], ...] (원본 픽셀, 모든 프레임에 같은 자리를 가린다)
+        "applied": ((), ()), "pargs": None,
+    }
+
+
+def video_decisions(edit: dict) -> tuple[frozenset, frozenset]:
+    """편집 상태에서 (가리지 않을 사람 번호들, 등록 인물이어도 가릴 사람 번호들)을 꺼낸다."""
+    decision = edit["decision"]
+    return (frozenset(p for p, d in decision.items() if d == "unmask"),
+            frozenset(p for p, d in decision.items() if d == "mask"))
+
+
+def video_edit_snapshot(edit: dict) -> tuple:
+    """지금 편집 내용을 비교하기 쉬운 값으로 만든다. 결과 영상에 마지막으로 적용한 것과 같은지 볼 때 쓴다."""
+    return (tuple(sorted(edit["decision"].items())), tuple(tuple(m) for m in edit["manual"]))
+
+
+def video_picker_view(edit: dict, frame: int) -> dict:
+    """프레임 한 장의 얼굴 선택 컴포넌트에 넘길 값을 만든다. 박스 번호는 '사람 번호'(끊긴 track 을 이어 붙인 번호)다.
+
+    같은 열쇠로 다시 그릴 때 값이 바뀌면 컴포넌트가 새로 만들어지므로(사진과 같은 이유), 처음 계산한 값을 그대로 돌려준다.
+    처음에 '제외'로 보일 사람: 등록 인물로 빠진 사람 + 해제한 사람 - 다시 가리기로 한 사람.
+    """
+    from src.video import person_of
+
+    key = f"vpicker_{edit['run']}_{edit['version']}_{frame}"
+    if edit["pargs"] is not None and edit["pargs"]["key"] == key:
+        return edit["pargs"]
+    analysis, auto = edit["analysis"], edit["analysis"].auto_excluded[frame]
+    ids: list[int] = []
+    detected: list[dict] = []
+    for i, box in enumerate(analysis.boxes[frame]):
+        person = person_of(analysis, box["track_id"])
+        if person is None or person in ids:    # ID 가 없는 박스는 사람 단위로 고를 수 없어 보여 주지 않는다(가림은 그대로)
+            continue
+        ids.append(person)
+        detected.append({"xyxy": box["xyxy"], "conf": box["conf"], "auto_excluded": i in auto})
+    autos = [d["auto_excluded"] for d in detected]
+    decision = edit["decision"]
+    view = {
+        "key": key, "frame": frame, "ids": ids, "detected": detected, "autos": autos,
+        "excluded": [p for p, a in zip(ids, autos) if decision.get(p) == "unmask" or (p not in decision and a)],
+        "reset": [p for p, a in zip(ids, autos) if a],
+        "manual": [list(m) for m in edit["manual"]],
+    }
+    edit["pargs"] = view
+    return view
+
+
+def sync_video_edits(uploaded: UploadedFile) -> None:
+    """얼굴 선택 컴포넌트의 현재 값을 편집 상태(사람별 해제·가림, 직접 영역)에 옮긴다. 결과 영상은 적용 버튼을 눌러야 바뀐다.
+
+    사람마다 '그 장면에서 기본으로 보이는 상태(등록 인물이면 제외)'와 같아지면 결정을 지우고, 다르면 해제(unmask)/가림(mask)으로 기록한다.
+    사람 단위라서 한 장면에서 한 번 고르면 영상 전체에 적용된다. 직접 영역은 모든 프레임의 같은 자리에 적용된다.
+    """
+    edit = current_video_edit(uploaded)
+    if edit is None or edit["pargs"] is None:
+        return
+    view, analysis = edit["pargs"], edit["analysis"]
+    parsed = parse_edit(st.session_state.get(view["key"]), None, set(view["ids"]), (analysis.width, analysis.height))
+    if parsed is None:    # 아직 만지지 않았다
+        return
+    chosen = set(parsed["excluded"])
+    for person, auto in zip(view["ids"], view["autos"]):
+        want = person in chosen
+        if want == auto:
+            edit["decision"].pop(person, None)
+        else:
+            edit["decision"][person] = "unmask" if want else "mask"
+    edit["manual"] = parsed["manual"]
+
+
+@st.cache_data(show_spinner=False, max_entries=48)
+def video_frame_url(file_id: str, path: str, frame_idx: int) -> str:
+    """영상의 frame_idx 번째 프레임 미리보기 data URL. 같은 프레임은 한 번만 만든다."""
+    cap = cv2.VideoCapture(path)
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, frame = cap.read()
+    finally:
+        cap.release()
+    if not ok:
+        raise ValueError("영상에서 이 장면을 읽을 수 없습니다.")
+    return to_data_url(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), PREVIEW_MAX_WIDTH)
+
+
+def run_video(uploaded: UploadedFile, ui: JobUI) -> None:
+    """영상을 처리하면서 진행률 막대와 단계 표시줄을 갱신하고, 결과를 session_state 에 남긴다.
+
+    처음에는 얼굴을 찾아 처리하고(on_video_edit) 그때의 박스를 편집 상태에 남긴다. 이미 처리한 영상이면 얼굴을 다시 찾지 않고
+    클릭으로 고친 내용과 가리는 방식만 반영해 다시 만든다(on_video_rerender, 사진의 '적용'과 같다).
     process_video 는 진행률만 알려 주므로, 진행률이 1.0 이 되면 소리 합치기 단계로 보고, 처리가 끝난 뒤
     ensure_audio 로 원본 소리가 결과에 들어 있는지 확인하고 빠졌으면 합쳐 넣는다.
     """
     note = uploaded.name
     in_path = save_upload_to_temp(uploaded, "input")
     effect = st.session_state.get("effect", EFFECT_MOSAIC)
+    edit = current_video_edit(uploaded)
     ui.steps(-1, "차례를 확인하는 중...")
     ui.show_cancel()
     bar = st.progress(0.0, text="대기 중...")
@@ -1999,7 +2379,18 @@ def run_video(uploaded: UploadedFile, ui: JobUI) -> None:
             ui.steps(new_stage, note)
 
     try:
-        out_path, info = on_video(in_path, active_ref(), on_progress=on_progress, effect=effect, on_wait=ui.waiting)
+        if edit is not None:
+            edit["render"] += 1
+            unmask, mask = video_decisions(edit)
+            out_path, info = on_video_rerender(
+                in_path, edit["analysis"], effect, unmask, mask, tuple(tuple(m) for m in edit["manual"]), edit["render"],
+                on_progress=on_progress, on_wait=ui.waiting,
+            )
+            edit["applied"] = video_edit_snapshot(edit)
+        else:
+            out_path, info, analysis = on_video_edit(in_path, active_ref(), on_progress=on_progress, effect=effect, on_wait=ui.waiting)
+            st.session_state["run_counter"] += 1
+            st.session_state["video_edit"] = new_video_edit(uploaded, analysis, st.session_state["run_counter"]) if analysis is not None else None
     finally:
         bar.empty()    # 성공·실패·취소와 상관없이 진행률 막대를 지운다
     elapsed = time.perf_counter() - started
@@ -2009,29 +2400,50 @@ def run_video(uploaded: UploadedFile, ui: JobUI) -> None:
     st.session_state["video_result"] = {
         "key": video_result_key(uploaded), "path": out_path, "info": info, "audio": audio, "codec": codec, "effect": effect,
     }
-    record_metric("영상", uploaded.name, float(info.get("seconds", elapsed)), int(info.get("faces", 0)),
+    record_metric("영상", f"{uploaded.name} (다시 적용)" if edit is not None else uploaded.name,
+                  float(info.get("seconds", elapsed)), int(info.get("faces", 0)),
                   frames=int(info.get("frames", 1)), fps=info.get("fps"))
     ui.finish("처리 완료")
 
 
 def render_video_rows(uploaded: UploadedFile, ui: JobUI, effect: str, apply_key: str) -> None:
-    """업로드한 영상을 재생해 보여 주고 처리 결과를 보여 준다."""
+    """업로드한 영상을 재생해 보여 주고 처리 결과를 보여 준다. 처리한 뒤에는 사진처럼 왼쪽이 얼굴을 고르는 화면이 된다."""
     # 원본(왼쪽)과 결과(오른쪽)를 나란히 놓는다. 결과 칸은 처리가 끝난 뒤에 채워진다.
     res = st.session_state["video_result"]
     has_result = res is not None and res["key"] == video_result_key(uploaded) and Path(res["path"]).exists()
+    edit = current_video_edit(uploaded)
     col_orig, col_result = st.columns(2)
     with col_orig:
-        st.video(uploaded)    # 재생 버튼이 달린 플레이어
+        if edit is None:
+            st.video(uploaded)    # 재생 버튼이 달린 플레이어
+        else:
+            analysis = edit["analysis"]
+            frame = min(max(int(st.session_state.get("video_frame", 0)), 0), len(analysis.boxes) - 1)
+            view = video_picker_view(edit, frame)
+            input_path = str(get_workdir() / f"input{Path(uploaded.name).suffix.lower()}")
+            face_picker_boxes(
+                key=view["key"], src=video_frame_url(uploaded.file_id, input_path, frame), image_shape=(analysis.height, analysis.width),
+                detected=view["detected"], excluded=view["excluded"], manual=view["manual"],
+                reset_excluded=view["reset"], token=view["key"], ids=view["ids"],
+            )
     with col_result:
         if has_result:
             st.video(res["path"])
     with st.container(key="cap_row_video"):    # 두 이름표를 같은 높이에 한 줄로
         cap_orig, cap_result = st.columns(2)
         with cap_orig:
-            st.caption("원본")
+            st.caption("원본 (얼굴을 클릭해 편집)" if edit is not None else "원본")
         with cap_result:
             if has_result:
                 st.caption(f"{res.get('effect', EFFECT_MOSAIC)} 결과")
+
+    if edit is not None:
+        st.caption(
+            f"얼굴을 클릭하면 {effect}가 해제되고 다시 클릭하면 가려져요. 한 번 고르면 영상 전체에 적용돼요. "
+            "빈 곳을 끌면 영상 전체에서 같은 자리를 가리는 직접 영역이 생겨요."
+        )
+        if video_edit_snapshot(edit) != edit["applied"]:
+            st.info(f"고친 내용이 있어요. 아래 '{effect} 적용' 버튼을 누르면 결과 영상에 반영돼요.")
 
     def render_save() -> None:    # 버튼 줄의 오른쪽 칸 (처리한 결과가 있을 때만)
         if has_result:
@@ -2060,38 +2472,181 @@ def render_video_rows(uploaded: UploadedFile, ui: JobUI, effect: str, apply_key:
         render_result_info(lines, out.parent)
 
 
-def render_stream() -> None:
-    """실시간 주소를 입력받아 on_stream 의 프레임을 차례로 화면에 보여 준다."""
-    url = st.text_input("실시간 주소", placeholder="rtsp://... 또는 유튜브 라이브 주소")
-    st.caption("멈추려면 다른 버튼을 누르거나 화면을 새로고침하세요.")
+def render_stream_url() -> str:
+    """실시간 주소 입력칸과 [등록] 버튼을 그리고, 확인한 주소를 돌려준다. 아직 확인하지 않았으면 빈 문자열.
 
-    if not (st.button("실시간 시작", key="run_stream") and url):
-        return
+    입력칸과 버튼을 한 폼으로 묶어서, [등록] 버튼을 눌러도 엔터를 눌러도 입력한 값이 한 번에 넘어온다. (폼이 아니면 입력칸을 벗어나는 순간
+    화면이 한 번 다시 그려지면서 곧바로 이어지는 버튼 클릭을 놓칠 수 있다.) 확인한 주소가 있어야 아래의 인물 등록과 비교 영역이 나타난다.
+    """
+    with st.container(key="stream_url_row"):
+        with st.form("stream_url_form", border=False):
+            col_input, col_apply = st.columns([6, 1], vertical_alignment="bottom")
+            with col_input:
+                typed = st.text_input("실시간 주소", placeholder="실시간 주소를 입력하세요", key="stream_url").strip()
+            with col_apply:
+                submitted = st.form_submit_button("등록")
+        if submitted:
+            st.session_state["stream_url_applied"] = typed
+    return st.session_state.get("stream_url_applied", "")
 
-    frame_box = st.empty()    # 같은 자리에 프레임을 계속 덮어 그린다
-    info_box = st.empty()
-    frames = iter(on_stream(url, st.session_state["ref_embs"]))
+
+class LiveJob:
+    """스레드로 도는 실시간 처리 하나.
+
+    Streamlit 은 위젯(예: 모자이크/블러 전환)을 건드리면 실행 중이던 스크립트를 중단한다. 처리를 스크립트 안에서 돌리면 그때 영상이 끊기므로,
+    스크립트와 상관없이 도는 스레드에 맡기고 화면은 여기서 최신 프레임만 읽어 간다. 가리는 방식은 effect 에 적어 두면 프레임마다 반영된다.
+    """
+
+    def __init__(self, url: str, ref_embs: Optional[np.ndarray], effect: str) -> None:
+        self.url = url
+        self.ref_embs = ref_embs            # 시작할 때의 등록 인물 (도는 중에는 바꿀 수 없다)
+        self.effect = effect                # 지금의 가리는 방식 (화면이 바꾼다)
+        self.lock = threading.Lock()
+        self.pair: Optional[tuple] = None   # 가장 최근 (원본 RGB, 결과 RGB)
+        self.info: dict = {}
+        self.error: Optional[tuple] = None  # ("module" | "text", 내용)
+        self.done = False
+        self.stop = threading.Event()
+        self.last_seen = time.monotonic()   # 화면이 마지막으로 들여다본 시각
+        self.thread: Optional[threading.Thread] = None
+
+    def should_stop(self) -> bool:
+        """멈추라고 했거나, 화면이 STREAM_IDLE_STOP 초 넘게 소식이 없으면(탭을 닫음) True."""
+        return self.stop.is_set() or time.monotonic() - self.last_seen > STREAM_IDLE_STOP
+
+
+def run_live_job(job: LiveJob, queue: object) -> None:
+    """LiveJob 의 스레드 본체. 프레임이 올 때마다 job 에 최신 (원본, 결과)를 남기고, 끝나면 오류(있다면)와 함께 done 을 켠다."""
     try:
-        with st.spinner("실시간 스트림에 연결하고 첫 프레임을 준비하는 중..."):
-            first_frame = next(frames)
-
-        def show_frame(frame_rgb: np.ndarray, info: dict) -> None:
-            frame_box.image(frame_rgb, use_container_width=True)
-            info_box.caption(
-                f"현재 얼굴 {info['faces_now']}개 · 누적 {info['faces_total']}명 · {info['fps']:.1f} FPS"
-            )
-
-        show_frame(*first_frame)
-        for frame_rgb, info in frames:
-            show_frame(frame_rgb, info)
+        frames = on_stream(job.url, job.ref_embs, lambda: job.effect, queue=queue, should_stop=job.should_stop)
+        try:
+            for result_rgb, info in frames:
+                original_rgb = info.pop("original_rgb")
+                with job.lock:
+                    job.pair, job.info = (original_rgb, result_rgb), info
+        finally:
+            frames.close()    # 자리를 반드시 돌려준다
     except ImportError as err:
-        show_module_missing(err)
+        job.error = ("module", err)
     except BusyError as err:
-        st.error(str(err))
-    except (OSError, RuntimeError, ValueError) as err:
-        st.error(f"실시간 스트림을 처리하지 못했습니다. {err}")
+        job.error = ("text", str(err))
+    except (OSError, RuntimeError, ValueError) as err:    # StreamError(원인을 알려 주는 안내)도 RuntimeError 다
+        job.error = ("text", f"실시간 스트림을 처리하지 못했습니다. {err}")
+    except Exception as err:    # 예상하지 못한 오류도 앱을 멈추지 않고 안내하고, 자세한 내용은 터미널 로그에 남긴다
+        logging.getLogger(__name__).exception("실시간 스트림 처리 중 예상하지 못한 오류")
+        job.error = ("text", f"실시간 스트림을 처리하는 중 예상하지 못한 오류가 났습니다 ({type(err).__name__}). 주소를 확인하고 다시 시도해 주세요. 자세한 내용은 서버 터미널에 기록했습니다.")
     finally:
-        frames.close()    # 화면이 멈출 때 자물쇠가 확실히 풀리게 한다
+        job.done = True
+
+
+def start_live(url: str, effect: str) -> None:
+    """실시간 처리를 스레드로 시작한다. (등록 인물은 지금 값으로 고정된다)"""
+    job = LiveJob(url, st.session_state["ref_embs"], effect)
+    job.thread = threading.Thread(target=run_live_job, args=(job, get_queue()), name="live-stream", daemon=True)
+    job.thread.start()
+    st.session_state["live"] = job
+    st.session_state["live_last"] = None
+    st.session_state["live_error"] = None
+
+
+def stop_live() -> None:
+    """돌고 있는 실시간 처리가 있으면 멈추고(자리를 돌려줄 때까지 잠깐 기다린다) 마지막 화면을 남긴다. 없으면 아무 일도 안 한다."""
+    job = st.session_state.get("live")
+    if job is None:
+        return
+    job.stop.set()
+    if job.thread is not None:
+        job.thread.join(timeout=5.0)
+    with job.lock:
+        st.session_state["live_last"] = (job.pair, job.info) if job.pair is not None else None
+    st.session_state["live"] = None
+
+
+def settle_live() -> None:
+    """저절로 끝난 실시간 처리(오류 · 방송 종료)가 있으면 오류와 마지막 화면을 남기고 비운다."""
+    job = st.session_state.get("live")
+    if job is None or not job.done:
+        return
+    with job.lock:
+        st.session_state["live_last"] = (job.pair, job.info) if job.pair is not None else None
+    st.session_state["live_error"] = job.error
+    st.session_state["live"] = None
+
+
+def draw_live_pair(pair: tuple, info: dict, effect: str) -> None:
+    """왼쪽에 원본, 오른쪽에 가린 결과를 나란히 보여 주고, 이름표와 현재 인원·속도를 아래에 붙인다. (사진·영상 탭의 비교와 같은 모양)"""
+    col_orig, col_result = st.columns(2)
+    with col_orig:
+        st.image(pair[0], use_container_width=True, output_format="JPEG")
+    with col_result:
+        st.image(pair[1], use_container_width=True, output_format="JPEG")
+    with st.container(key="cap_row_live"):
+        cap_orig, cap_result = st.columns(2)
+        with cap_orig:
+            st.caption("원본")
+        with cap_result:
+            st.caption(f"{effect} 결과")
+    if info:
+        st.caption(f"현재 얼굴 {info['faces_now']}개 · 누적 {info['faces_total']}명 · {info['fps']:.1f} FPS")
+
+
+@st.fragment(run_every=LIVE_VIEW_REFRESH)
+def render_live_fragment(job: LiveJob) -> None:
+    """도는 실시간 처리의 최신 프레임을 LIVE_VIEW_REFRESH 초마다 가져와 그린다. 화면 전체를 다시 그리지 않아 모자이크/블러를 바꿔도 끊기지 않는다.
+
+    이 호출이 '화면이 살아 있다'는 신호이기도 하다(last_seen). 처리가 끝났으면 화면 전체를 한 번 다시 그려 버튼과 오류를 정리한다.
+    """
+    job.last_seen = time.monotonic()
+    with job.lock:
+        pair, info, done = job.pair, dict(job.info), job.done
+    if pair is not None:
+        draw_live_pair(pair, info, job.effect)
+    else:
+        st.markdown('<div class="finding">실시간 스트림에 연결하는 중...</div>', unsafe_allow_html=True)
+    if done:
+        st.rerun()
+
+
+def render_stream_compare(url: str) -> None:
+    """'원본과 결과 비교' 카드(실시간): 가리는 방식 -> 왼쪽 원본 · 오른쪽 결과 -> [실시간 시작] / [정지].
+
+    처리는 스레드(LiveJob)가 하고 화면은 그 프레임을 보여 주기만 해서, 도는 중에 모자이크/블러를 바꿔도 영상이 끊기지 않는다.
+    제외할 얼굴은 바로 위 인물 등록 카드에서 미리 고른다(등록한 인물은 모자이크·블러에서 빠진다).
+    """
+    settle_live()
+    job = st.session_state.get("live")
+    if job is not None and job.url != url:    # 다른 주소를 확인했다
+        stop_live()
+        job = None
+    effect = st.session_state.get("effect", EFFECT_MOSAIC)
+    render_card_heading("원본과 결과 비교", f"왼쪽이 원본, 오른쪽이 {effect} 결과입니다.")
+    with st.container(key="mode_picker_effect"):    # 사진/영상 전환 버튼과 같은 알약 모양
+        effect = st.radio("가리는 방식", EFFECTS, key="effect", horizontal=True, label_visibility="collapsed")
+    if job is not None:
+        job.effect = effect    # 도는 중에도 다음 프레임부터 바로 반영된다
+
+    view = st.container()    # 원본·결과 자리. 버튼 처리가 끝난 뒤 채운다
+    with st.container(key="stream_start"):    # 파일 선택(Browse files) 버튼과 같은 모양으로 가운데에 놓는다
+        if job is None:
+            if st.button("실시간 시작", key="run_stream"):
+                start_live(url, effect)
+                st.rerun()
+        elif st.button("정지", key="stop_stream"):
+            stop_live()
+            st.rerun()
+
+    with view:
+        if job is not None:
+            render_live_fragment(job)
+        elif st.session_state.get("live_last") is not None:
+            pair, info = st.session_state["live_last"]
+            draw_live_pair(pair, info, effect)
+    error = st.session_state.get("live_error")
+    if error is not None and job is None:
+        if error[0] == "module":
+            show_module_missing(error[1])
+        else:
+            st.error(error[1])
 
 
 # ============================================================
@@ -2107,14 +2662,38 @@ def sync_ref_embs() -> None:
     st.session_state["ref_embs"] = np.vstack([p["embs"] for p in people.values()]) if people else None
 
 
+def unit_rows(embs: np.ndarray) -> np.ndarray:
+    """(k, d) 벡터들을 행마다 길이 1 로 맞춘다."""
+    arr = np.asarray(embs, dtype=np.float32).reshape(-1, np.asarray(embs).shape[-1])
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    return arr / np.maximum(norms, 1e-9)
+
+
+def find_registered_person(embs: np.ndarray) -> Optional[tuple]:
+    """등록한 사람 중 embs(후보의 얼굴 벡터들)와 같은 사람으로 볼 만큼 닮은 사람의 열쇠. 없으면 None.
+
+    기준은 인물 제외가 쓰는 것과 같은 SIM_THRESHOLD 다. 그래서 '등록됨'으로 보이는 사람은 실제로 제외도 되는 사람이다.
+    (후보 번호로만 판정하면 새 파일에서 같은 사람을 다시 찾았을 때 '등록'으로 보이는 문제가 있었다)
+    """
+    cand = unit_rows(embs)
+    best_key, best = None, SIM_THRESHOLD
+    for key, person in st.session_state["ref_people"].items():
+        sim = float(np.max(unit_rows(person["embs"]) @ cand.T))
+        if sim >= best:
+            best_key, best = key, sim
+    return best_key
+
+
 def toggle_candidate(cand_key: tuple, embs: np.ndarray, thumb_bgr: np.ndarray) -> None:
     """후보의 '등록' 태그 버튼 콜백. 꺼져 있으면 이 사람을 등록하고(켜짐), 이미 등록된 사람이면 그 사람만 해제한다(꺼짐).
 
-    사람마다 따로 켜고 끌 수 있어서 여러 명을 등록할 수 있다. 등록한 사람은 모두 모자이크에서 빠진다.
+    이미 등록된 사람인지는 후보 번호가 아니라 얼굴이 닮았는지(find_registered_person)로 본다. 그래서 '유지'한 사람이 새 파일의 후보에서도
+    '✓ 등록됨'으로 보이고, 눌러서 해제할 수 있다. 사람마다 따로 켜고 끌 수 있어서 여러 명을 등록할 수 있다. 등록한 사람은 모두 모자이크에서 빠진다.
     """
     people = st.session_state["ref_people"]
-    if cand_key in people:
-        del people[cand_key]
+    matched = cand_key if cand_key in people else find_registered_person(embs)
+    if matched is not None:
+        del people[matched]
     else:
         people[cand_key] = {"embs": embs, "thumb": cv2.cvtColor(thumb_bgr, cv2.COLOR_BGR2RGB)}
     st.session_state["keep_question"] = False    # 직접 등록·해제하고 있으니 더 묻지 않는다
@@ -2134,6 +2713,7 @@ def reset_file_state() -> None:
     st.session_state["candidates_for"] = None
     st.session_state["image_results"] = {}
     st.session_state["video_result"] = None
+    st.session_state["video_edit"] = None
 
 
 def answer_keep_people() -> None:
@@ -2181,7 +2761,7 @@ def render_person_card(mode: str, files: list[UploadedFile]) -> None:
     with st.container(key="card_person"):
         with st.container(key="person_head"):    # 제목은 왼쪽, 버튼은 오른쪽 끝
             st.markdown('<div class="card-title">인물 등록</div>', unsafe_allow_html=True)
-            find_clicked = st.button("모자이크 제외할 얼굴 선택", key="find_candidates")
+            find_clicked = st.button("모자이크 제외할 얼굴 선택", key="find_candidates", disabled=candidate_job_pending())
         people = st.session_state["ref_people"]
         if people and st.session_state.get("keep_question"):    # 새 파일을 올렸고 등록해 둔 인물이 있으면 유지할지 묻는다
             with st.container(key="keep_ask"):
@@ -2203,29 +2783,54 @@ def render_person_card(mode: str, files: list[UploadedFile]) -> None:
             st.session_state["candidates"] = None
 
         if find_clicked:
-            try:
-                with st.spinner("얼굴을 찾는 중..."):
-                    st.session_state["candidates"] = on_register(sources)
-                    st.session_state["candidates_for"] = source_id
-            except ImportError as err:
-                show_module_missing(err)
-            except (ValueError, OSError, RuntimeError) as err:    # 파일을 읽을 수 없음 · 모델 내려받기 실패 · 인식 엔진 오류
-                st.error(f"얼굴 후보를 찾지 못했습니다: {err}")
-            request_scroll("person")    # 후보가 보이도록 이 카드의 아래쪽으로 내려간다
+            start_candidate_job(sources, source_id)
+            st.rerun()    # 방금 시작한 일을 반영해 버튼을 막고 '찾는 중'을 보이려고 한 번 더 그린다 (일은 스레드가 계속한다)
+        settle_candidate_job(source_id)    # 이미 끝난 일이 있으면 결과를 반영한다
         render_candidates(source_id)
-
-        if people:    # 등록된 사람들은 이 카드 맨 아래에만 나오고, 모두 해제하는 버튼도 여기 하나뿐이다
-            with st.container(key="reg_row"):
-                st.markdown(f'<span class="reg-tag on">✓ 등록됨({len(people)}명)</span>', unsafe_allow_html=True)
-                with st.container(key="reg_thumbs"):
-                    for person in people.values():
-                        st.image(square_thumb(person["thumb"], REGISTERED_THUMB_WIDTH * 2), width=REGISTERED_THUMB_WIDTH)
-                with st.container(key="clear_row"):
-                    st.button("등록 해제", key="clear_ref", on_click=clear_registration)
+        render_candidate_loading()
+        render_registered_people()
 
 
-def render_candidates(source_id: str) -> None:
-    """찾은 얼굴 후보를 작은 사진으로 격자에 늘어놓고, 사진마다 '등록' 태그 버튼을 둔다. 등록된 후보는 '✓ 등록됨'(켜짐)으로 색이 확 바뀐다."""
+def render_stream_person_card(url: str) -> None:
+    """실시간 주소의 '인물 등록' 카드. 사진·영상 탭의 카드와 같은 모양·같은 동작이고, 후보를 올린 파일 대신 스트림에서 찾는 것만 다르다.
+
+    [모자이크 제외할 얼굴 선택]을 누르면 그 스트림에서 STREAM_CAPTURE_FRAMES 장을 STREAM_CAPTURE_INTERVAL 초 간격으로 자동 캡처해
+    얼굴 후보를 만든다. 실시간 처리가 도는 동안에는 등록을 바꿀 수 없어서 버튼이 막힌다(바꾸려면 [정지]).
+    """
+    running = st.session_state.get("live") is not None
+    with st.container(key="card_person"):
+        with st.container(key="person_head"):    # 제목은 왼쪽, 버튼은 오른쪽 끝
+            st.markdown('<div class="card-title">인물 등록</div>', unsafe_allow_html=True)
+            find_clicked = st.button("모자이크 제외할 얼굴 선택", key="find_candidates", disabled=candidate_job_pending() or running)
+        st.caption("실시간 처리 중에는 등록을 바꿀 수 없습니다. 변경하려면 멈추세요.")
+        source_id = f"stream|{url}"
+        if st.session_state["candidates_for"] != source_id:    # 다른 주소로 바뀌면 이전 후보는 지운다
+            st.session_state["candidates"] = None
+        if find_clicked:
+            start_stream_candidate_job(url, source_id)
+            st.rerun()
+        settle_candidate_job(source_id)
+        render_candidates(source_id, locked=running)
+        render_candidate_loading()
+        render_registered_people(locked=running)
+
+
+def render_registered_people(locked: bool = False) -> None:
+    """등록된 사람들을 카드 맨 아래 한 줄(태그 · 작은 사진들 · 등록 해제)로 보여 준다. 모두 해제하는 버튼도 여기 하나뿐이다. locked 면 해제 버튼을 막는다."""
+    people = st.session_state["ref_people"]
+    if not people:
+        return
+    with st.container(key="reg_row"):
+        st.markdown(f'<span class="reg-tag on">✓ 등록됨({len(people)}명)</span>', unsafe_allow_html=True)
+        with st.container(key="reg_thumbs"):
+            for person in people.values():
+                st.image(square_thumb(person["thumb"], REGISTERED_THUMB_WIDTH * 2), width=REGISTERED_THUMB_WIDTH)
+        with st.container(key="clear_row"):
+            st.button("등록 해제", key="clear_ref", on_click=clear_registration, disabled=locked)
+
+
+def render_candidates(source_id: str, locked: bool = False) -> None:
+    """찾은 얼굴 후보를 작은 사진으로 격자에 늘어놓고, 사진마다 '등록' 태그 버튼을 둔다. 등록된 후보는 '✓ 등록됨'(켜짐)으로 색이 확 바뀐다. locked 면 버튼을 막는다."""
     candidates = st.session_state["candidates"]
     if candidates is None:
         return                                  # 아직 찾기 전
@@ -2237,12 +2842,12 @@ def render_candidates(source_id: str) -> None:
     with st.container(key="cgrid"):             # CSS 격자: 한 칸에 후보 하나 (사진 · 이름표 · 등록 태그). 창이 좁아지면 줄만 바뀐다
         for i, cand in enumerate(candidates):
             cand_key = (source_id, i)
-            registered = cand_key in people
+            registered = cand_key in people or find_registered_person(cand["embs"]) is not None    # 다른 파일에서 등록한 같은 사람도 '등록됨'
             with st.container(key=f"cand_{i}"):
                 st.image(square_thumb(cv2.cvtColor(cand["thumb"], cv2.COLOR_BGR2RGB), CANDIDATE_THUMB_WIDTH * 2), width=CANDIDATE_THUMB_WIDTH)
                 st.caption(f"후보 {i + 1} · {cand['frames']}회")
                 with st.container(key=f"pick_{'on' if registered else 'off'}_{i}"):    # 켜짐/꺼짐에 따라 CSS 가 다른 색을 입힌다
-                    st.button("✓ 등록됨" if registered else "등록", key=f"pick_{i}",
+                    st.button("✓ 등록됨" if registered else "등록", key=f"pick_{i}", disabled=locked,
                               on_click=toggle_candidate, args=(cand_key, cand["embs"], cand["thumb"]))
 
 

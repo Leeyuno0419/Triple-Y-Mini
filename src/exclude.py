@@ -32,6 +32,7 @@ from src.config import (
     CANDIDATE_SAMPLE_FPS,
     DET_SIZE,
     DET_THRESH,
+    EMBED_MAX_TURN,
     EXCLUDE_GRACE_FRAMES,
     JUDGE_CANVAS_SCALE,
     JUDGE_MAX_TURN,
@@ -515,6 +516,41 @@ def _judge_face(img: np.ndarray, box: Box, ref: np.ndarray, threshold: float) ->
     except Exception:    # 인식 중 오류는 '제외하지 않음'(모자이크 유지)으로 안전하게 처리하고 기록만 남긴다
         _log.exception("인물 판정 중 오류가 나서 이 박스는 모자이크합니다.")
         return None, False
+
+
+def embed_face(img: np.ndarray, xyxy: tuple[int, int, int, int]) -> Optional[dict]:
+    """img(BGR)의 xyxy 박스 안 얼굴 하나를 인물 등록용 후보로 만든다: {"thumb": 얼굴(BGR), "embs": (1, d) 벡터, "frames": 1, "score": 크기}. 쓸 수 없으면 None.
+
+    사진·영상 화면에서 사용자가 얼굴을 직접 클릭해 제외했을 때 그 사람을 인물 등록에도 올리려고 쓴다. list_candidates 의 후보와 같은 모양이다.
+    다음이면 None 이다: 짧은 변이 MIN_VERIFY_SIZE 미만 / 잘라낸 곳에서 얼굴이나 벡터를 못 찾음 / 얼굴이 EMBED_MAX_TURN 보다 많이 돌아가 있음.
+    (작은 얼굴이나 옆얼굴의 벡터는 믿기 어려워서, 그것으로 등록하면 다른 사람을 제외로 잘못 볼 수 있다. 이때는 그 장면에서만 제외되고 등록되지는 않는다)
+    """
+    x1, y1, x2, y2 = xyxy
+    if min(x2 - x1, y2 - y1) < MIN_VERIFY_SIZE:
+        return None
+    try:
+        crop = _crop(img, tuple(xyxy))
+        if crop.size == 0:
+            return None
+        canvas = _on_canvas(crop)
+        faces = get_face_app().get(canvas)
+        if not faces:
+            return None
+        side = canvas.shape[0]
+
+        def off_center(f: Any) -> float:    # 대상 얼굴은 캔버스 한가운데에 있다 (_judge_face 와 같다)
+            fx1, fy1, fx2, fy2 = _face_box(f, side, side)
+            return float(np.hypot((fx1 + fx2) / 2 - side / 2, (fy1 + fy2) / 2 - side / 2))
+
+        face = min(faces, key=off_center)
+        emb = _face_embedding(face)
+        turn = _face_turn(face)
+        if emb is None or (turn is not None and abs(turn) > EMBED_MAX_TURN):
+            return None
+        return {"thumb": crop.copy(), "embs": emb.reshape(1, -1), "frames": 1, "score": float(min(x2 - x1, y2 - y1))}
+    except Exception:
+        _log.exception("클릭한 얼굴의 벡터를 만들지 못했습니다.")
+        return None
 
 
 def _judge(img: np.ndarray, box: Box, ref: np.ndarray, threshold: float) -> Optional[bool]:
