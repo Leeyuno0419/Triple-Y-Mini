@@ -2070,17 +2070,26 @@ def render_stream() -> None:
 
     frame_box = st.empty()    # 같은 자리에 프레임을 계속 덮어 그린다
     info_box = st.empty()
-    frames = on_stream(url, st.session_state["ref_embs"])
+    frames = iter(on_stream(url, st.session_state["ref_embs"]))
     try:
-        for frame_rgb, info in frames:
+        with st.spinner("실시간 스트림에 연결하고 첫 프레임을 준비하는 중..."):
+            first_frame = next(frames)
+
+        def show_frame(frame_rgb: np.ndarray, info: dict) -> None:
             frame_box.image(frame_rgb, use_container_width=True)
             info_box.caption(
                 f"현재 얼굴 {info['faces_now']}개 · 누적 {info['faces_total']}명 · {info['fps']:.1f} FPS"
             )
+
+        show_frame(*first_frame)
+        for frame_rgb, info in frames:
+            show_frame(frame_rgb, info)
     except ImportError as err:
         show_module_missing(err)
     except BusyError as err:
         st.error(str(err))
+    except (OSError, RuntimeError, ValueError) as err:
+        st.error(f"실시간 스트림을 처리하지 못했습니다. {err}")
     finally:
         frames.close()    # 화면이 멈출 때 자물쇠가 확실히 풀리게 한다
 
