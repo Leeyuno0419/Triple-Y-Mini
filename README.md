@@ -38,7 +38,7 @@ pip install -r requirements.txt
 - 기획서를 고친 뒤 PDF 재생성: `python tools\md_to_pdf.py 기획서.md 기획서.pdf` (reportlab, 맑은 고딕 글꼴 필요)
 
 ## 얼굴 탐지 모델 준비 (`detect_faces`)
-지금은 사전학습 가중치 [yolov11n-face](https://github.com/akanametov/yolo-face) (WIDER FACE로 학습, GPL-3.0)를 `weights\best.pt`로 쓴다. 직접 학습을 하기로 해서 모델이 나오면 A가 `best.pt`만 교체한다.
+사전학습 가중치 [yolov11n-face](https://github.com/akanametov/yolo-face) (WIDER FACE로 학습, GPL-3.0)를 `weights\best.pt`로 쓴다. 사전학습 모델로 얼굴 탐지가 충분해 직접 학습은 하지 않기로 했다 (11-02).
 ```powershell
 Invoke-WebRequest https://github.com/akanametov/yolo-face/releases/download/1.0.0/yolov11n-face.pt -OutFile weights\best.pt
 ```
