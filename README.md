@@ -31,6 +31,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 - `requirements.txt`는 패키지를 추가할 때 버전과 함께 적는다.
+- YouTube 실시간 스트림용 `yt-dlp`와 ONNX·protobuf 호환 버전도 포함되어 있으므로, 별도 패키지 설치 없이 위의 `pip install -r requirements.txt` 한 번으로 준비한다.
 - 영상 소리 병합에 ffmpeg가 필요하다. Colab·리눅스 서버는 기본 제공, Windows는 별도 설치 후 PATH에 등록한다.
 - 비밀키·API 키는 프로젝트 루트의 `.env`에 둔다 (git 제외).
 - 데이터와 가중치(`best.pt`)는 git에 올리지 않으므로 팀 공유 폴더(Drive·서버)에서 받는다.
