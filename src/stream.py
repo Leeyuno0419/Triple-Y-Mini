@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 import cv2
 import numpy as np
 
-from src.video import BoxHolder, _load_exclusion_filter
+from src.video import BoxHolder, _SceneCutDetector, _load_exclusion_filter
 
 _DETECT_MAX_SIDE = 640
 
@@ -57,8 +57,11 @@ def process_stream(url: str, ref_embs: Optional[np.ndarray] = None) -> Iterator[
     reset_tracker()
     lock = threading.Lock()
     changed = threading.Event()
-    state: dict = {"frame": None, "error": None, "done": False}
+    # "cut": 처리 루프가 마지막으로 가져간 뒤 장면 전환이 있었는지. 처리 루프는 프레임을 건너뛰므로
+    # 판정은 모든 프레임을 읽는 캡처 스레드에서 바로 붙은 프레임끼리 한다 (SCENE_CUT_CORR 가 그 기준).
+    state: dict = {"frame": None, "cut": False, "error": None, "done": False}
     stop = threading.Event()
+    scene_cut = _SceneCutDetector()
 
     def capture_loop() -> None:
         failures = 0
@@ -89,8 +92,10 @@ def process_stream(url: str, ref_embs: Optional[np.ndarray] = None) -> Iterator[
                             next_frame_at += frame_interval
                             if stop.wait(max(0.0, next_frame_at - now)):
                                 break
+                    cut = scene_cut.update(frame)
                     with lock:
                         state["frame"] = frame
+                        state["cut"] = state["cut"] or cut
                     changed.set()
                 capture.release()
                 capture = None
@@ -114,7 +119,8 @@ def process_stream(url: str, ref_embs: Optional[np.ndarray] = None) -> Iterator[
     worker.start()
     holder = BoxHolder()
     exclude_cache: dict = {}
-    track_ids: set[int] = set()
+    track_ids: set[tuple[int, int]] = set()  # (장면 번호, track_id): 장면 전환 때 track_id 가 1 부터 다시 매겨진다
+    scene = 0
     frame_idx = 0
     processed = 0
     yield_times: deque[float] = deque(maxlen=15)
@@ -129,10 +135,19 @@ def process_stream(url: str, ref_embs: Optional[np.ndarray] = None) -> Iterator[
                 done = state["done"]
                 if frame is not None and frame is last_frame:
                     frame = None
+                cut = frame is not None and state["cut"]
+                if frame is not None:
+                    state["cut"] = False
             if error is not None:
                 raise error
             if frame is not None:
                 last_frame = frame
+                # 장면이 바뀌면 이전 장면의 추적·유지 박스·제외 판정을 버린다 (process_video 와 같음).
+                if cut:
+                    reset_tracker()
+                    holder = BoxHolder()
+                    exclude_cache.clear()
+                    scene += 1
                 height, width = frame.shape[:2]
                 scale = min(1.0, _DETECT_MAX_SIDE / max(height, width))
                 if scale < 1.0:
@@ -158,7 +173,7 @@ def process_stream(url: str, ref_embs: Optional[np.ndarray] = None) -> Iterator[
                         }
                         for box in boxes
                     ]
-                track_ids.update(b["track_id"] for b in boxes if b["track_id"] is not None)
+                track_ids.update((scene, b["track_id"]) for b in boxes if b["track_id"] is not None)
                 boxes = holder.update(boxes, frame_idx)
                 if filter_excluded is not None:
                     boxes = filter_excluded(frame, boxes, ref_embs, cache=exclude_cache)
