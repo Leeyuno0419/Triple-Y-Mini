@@ -23,6 +23,9 @@ from src.config import (
     HOLD_FRAMES,
     MAX_FILL_GAP,
     SCENE_CUT_CORR,
+    SCENE_CUT_MIN_GAP,
+    SCENE_FLAT_STD,
+    SCENE_THUMB_SIZE,
     UNTRACKED_HOLD_FRAMES,
     UNTRACKED_MATCH_IOU,
 )
@@ -194,19 +197,6 @@ class BoxHolder:
         return current + held
 
 
-def frame_signature(frame: np.ndarray) -> np.ndarray:
-    """장면 전환을 찾으려고 프레임을 32x18 흑백으로 줄인 값. (main 의 _frame_thumb 와 같다)"""
-    return _frame_thumb(frame)
-
-
-def find_cuts(signatures: list[np.ndarray]) -> frozenset:
-    """새 장면이 시작하는 프레임 번호 모음. 바로 앞 프레임과의 밝기 구조 상관이 SCENE_CUT_CORR 보다 낮으면 컷이다. (0번 프레임은 포함하지 않는다)
-
-    판정은 main 의 _is_scene_cut 하나를 쓴다. 그래서 처리 중 추적기를 비우는 시점과 여기서 구하는 컷이 항상 같다.
-    """
-    return frozenset(i for i in range(1, len(signatures)) if _is_scene_cut(signatures[i - 1], signatures[i]))
-
-
 @dataclass
 class VideoAnalysis:
     """영상을 한 번 처리한 뒤 남기는, 결과를 다시 만들 때 쓰는 값. 프레임 이미지는 담지 않아 가볍다.
@@ -335,7 +325,7 @@ def merge_audio_h264(video_path: str, audio_src: str, out_path: str) -> None:
 def _frame_thumb(frame: np.ndarray) -> np.ndarray:
     """장면 전환 감지용: 프레임을 32x18 흑백으로 줄여 1차원 벡터로 반환한다."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    return cv2.resize(gray, (32, 18), interpolation=cv2.INTER_AREA).astype(np.float32).ravel()
+    return cv2.resize(gray, SCENE_THUMB_SIZE, interpolation=cv2.INTER_AREA).astype(np.float32).ravel()
 
 
 def _is_scene_cut(prev_thumb: Optional[np.ndarray], thumb: np.ndarray) -> bool:
@@ -344,9 +334,34 @@ def _is_scene_cut(prev_thumb: Optional[np.ndarray], thumb: np.ndarray) -> bool:
     상관계수는 전체 밝기·대비 변화(무대 조명)에는 거의 변하지 않고, 화면 구성이 바뀔 때만 크게 떨어진다.
     한쪽이 단색 화면이면 상관을 잴 수 없어 장면 전환으로 보지 않는다.
     """
-    if prev_thumb is None or prev_thumb.std() < 1e-3 or thumb.std() < 1e-3:
+    if prev_thumb is None or prev_thumb.std() < SCENE_FLAT_STD or thumb.std() < SCENE_FLAT_STD:
         return False
     return float(np.corrcoef(prev_thumb, thumb)[0, 1]) < SCENE_CUT_CORR
+
+
+class _SceneCutDetector:
+    """프레임을 차례로 받아 장면 전환인지 판정한다 (process_video·process_stream 공용).
+
+    단색 화면(암전 등)은 비교 기준으로 삼지 않아, 암전 앞 화면과 뒤 화면을 비교한다.
+    전환 직후 min_gap 프레임 안에서 다시 잡힌 전환은 흔들림·잔상 효과로 보고 무시한다.
+    """
+
+    def __init__(self, min_gap: int = SCENE_CUT_MIN_GAP) -> None:
+        self.min_gap = min_gap
+        self._prev_thumb: Optional[np.ndarray] = None
+        self._frames_since_cut = min_gap  # 첫 전환은 바로 인정한다
+
+    def update(self, frame: np.ndarray) -> bool:
+        """이번 프레임이 장면 전환이면 True를 반환한다."""
+        self._frames_since_cut += 1
+        thumb = _frame_thumb(frame)
+        if thumb.std() < SCENE_FLAT_STD:
+            return False
+        cut = _is_scene_cut(self._prev_thumb, thumb) and self._frames_since_cut > self.min_gap
+        self._prev_thumb = thumb
+        if cut:
+            self._frames_since_cut = 0
+        return cut
 
 
 def _load_exclusion_filter():
@@ -423,8 +438,8 @@ def process_video_edit(
     base_boxes: list[list[Box]] = []
     auto_excluded: list[frozenset] = []
     per_frame: list[list[Box]] = []
-    signatures: list[np.ndarray] = []
-    prev_signature: Optional[np.ndarray] = None
+    scene_cut = _SceneCutDetector()
+    cut_frames: set[int] = set()    # 1패스에서 잡은 장면 전환. 보간과 2패스 초기화가 같은 컷을 쓰도록 여기서 한 번만 판정한다
     id_offset = 0    # 장면이 바뀌어 추적기를 비우면 track_id 가 1 부터 다시 매겨지므로, 영상 전체에서 겹치지 않게 이어 붙이는 값
     max_track_id = 0
     processed_frames = 0
@@ -442,12 +457,11 @@ def process_video_edit(
             if frame.shape[1] != width or frame.shape[0] != height:
                 raise ValueError("영상 프레임의 해상도가 일정하지 않습니다.")
 
-            signature = frame_signature(frame)
-            if _is_scene_cut(prev_signature, signature):
+            if scene_cut.update(frame):
                 # 장면이 바뀌면 추적기를 비운다. (남겨 두면 이전 장면의 번호가 같은 자리에 나온 다른 사람에게 붙는다)
                 reset_tracker()
                 id_offset = max_track_id
-            prev_signature = signature
+                cut_frames.add(len(per_frame))
 
             boxes = detect_faces(frame, track=True)
             for box in boxes:
@@ -456,7 +470,6 @@ def process_video_edit(
                     max_track_id = max(max_track_id, box["track_id"])
                     track_ids.add(box["track_id"])
             per_frame.append(boxes)
-            signatures.append(signature)
 
             if on_progress is not None and total_frames > 0:
                 on_progress(min(len(per_frame) / total_frames, 1.0) * detect_share)
@@ -467,7 +480,7 @@ def process_video_edit(
 
         # 뒤쪽 박스까지 알고 나서, 끊긴 공백을 앞뒤 박스로 보간한다. track_id 는 바꾸지 않고 대응표로만 인원 수를 센다.
         # 장면 전환을 가로질러 잇거나 채우면 다른 장면의 허공·몸통에 박스가 생기므로, 컷에서는 끊는다.
-        cuts = find_cuts(signatures)
+        cuts = frozenset(cut_frames)
         alias = stitch_tracks(per_frame, MAX_FILL_GAP, cuts=cuts)
         per_frame, _ = interpolate_gaps(per_frame, alias, MAX_FILL_GAP, cuts=cuts)
         faces = len({alias.get(track_id, track_id) for track_id in track_ids})
