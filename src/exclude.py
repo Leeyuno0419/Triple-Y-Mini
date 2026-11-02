@@ -43,6 +43,7 @@ from src.config import (
     RECHECK_FRAMES,
     REF_MAX_EMBS,
     SIM_THRESHOLD,
+    SIM_UNSURE_LOW,
 )
 from src.types import Box
 
@@ -349,13 +350,15 @@ def filter_excluded(
     박스마다 위에서부터 차례로 본다. 애매하면 언제나 모자이크하는 쪽(남기는 쪽)으로 정한다.
       1. 짧은 변이 MIN_VERIFY_SIZE 미만: 인식하지 않고 모자이크한다. 캐시에도 저장하지 않는다.
       2. track_id 가 있는(영상) 박스가 다른 박스와 겹침(IoU > 0): 그 track 의 캐시를 지우고 이번 프레임은 모자이크한다.
+         단, 이번 프레임 얼굴을 직접 판정해 threshold 이상이면 이번 프레임은 제외한다(캐시 없는 사진과 같은 기준).
          (겹치는 순간 track_id 가 서로 바뀌면 모르는 사람이 '제외' 판정을 넘겨받을 수 있기 때문이다.
          사진은 track_id 가 없어 이런 위험이 없으므로, 얼굴이 겹쳐 있어도 이 규칙 없이 바로 판정한다)
       3. 캐시에 "제외"는 RECHECK_FRAMES, "모자이크"(정면에서 다른 사람으로 봄)는 NEGATIVE_RECHECK_FRAMES 프레임마다 다시 판정한다.
          모자이크 쪽은 재확인에서 NEGATIVE_CONFIRM_HITS 번 연속 통과해야 제외로 뒤집는다. 옆얼굴이라 미룬 track 은 JUDGE_RETRY_FRAMES 프레임마다 다시 판정한다. (옆얼굴은 같은 사람도 유사도가 크게 떨어져서, 그 순간의
          낮은 값으로 '다른 사람'을 확정하면 정면이 나와도 영영 모자이크되기 때문이다)
       4. 캐시에 없으면 판정하고, track_id 가 있으면 결과를 캐시에 저장한다. 제외로 확정된 track 이 고개를 돌려 다시 판정이 미뤄지면
-         마지막 확실한 판정 뒤 EXCLUDE_GRACE_FRAMES 프레임까지는 제외를 유지한다.
+         마지막 확실한 판정 뒤 EXCLUDE_GRACE_FRAMES 프레임까지는 제외를 유지한다. 처음 보는 track 의 첫 '다른 사람' 판정은
+         옆얼굴처럼 미루고, 두 번째 '다른 사람' 판정에서 확정한다(제외 기준 threshold 는 그대로라 다른 사람이 제외될 위험은 늘지 않는다).
     판정: 박스를 여백(PAD)과 함께 잘라 얼굴 벡터를 구하고, ref_embs 와의 코사인 유사도 최댓값이 threshold 이상이면 제외.
     잘라낸 곳에서 얼굴을 못 찾거나 벡터를 못 만들면 제외하지 않는다(모자이크 유지). 이런 '판정 불가'는 캐시에 저장하지 않아
     다음 프레임에 다시 시도한다.
@@ -380,6 +383,11 @@ def filter_excluded(
         if track_id is not None and _overlaps_other(box, boxes, i):    # 2. 겹친 얼굴 (추적 ID 가 바뀔 수 있는 영상에서만)
             if cache is not None:
                 cache.pop(track_id, None)
+            # 겹친 동안은 캐시 대신 이 프레임의 얼굴을 직접 확인해, 임계값 이상일 때만 이번 프레임을 제외한다.
+            # (겹치는 사이 ID 가 다른 사람에게 넘어갔으면 여기서 걸러진다. 캐시 없는 사진과 같은 기준이다)
+            if cache is not None and _judge_face(img, box, ref, threshold)[0] is True:
+                cache[track_id] = {"exclude": True, "checked": frame_no, "ok": frame_no}
+                continue
             kept.append(box)
             continue
 
@@ -388,6 +396,10 @@ def filter_excluded(
             excluded, turned = _judge_face(img, box, ref, threshold)
             if cache is not None and track_id is not None:
                 prev = cache.get(track_id)
+                # 처음 보는(또는 판정을 미뤄 둔) track 의 첫 '다른 사람' 판정은 흐린 프레임 한 장일 수 있어 미루고, 두 번째에 확정한다
+                first_negative = excluded is False and (prev is None or (prev["exclude"] is None and not prev.get("neg1")))
+                if first_negative:
+                    excluded, turned = None, True
                 if prev is not None and prev["exclude"] is False:     # '다른 사람'으로 봤던 track 의 재확인: 연속으로 통과해야 뒤집는다
                     hits = prev.get("hits", 0) + 1 if excluded is True else (0 if excluded is False else prev.get("hits", 0))
                     if hits >= NEGATIVE_CONFIRM_HITS:
@@ -403,6 +415,8 @@ def filter_excluded(
                         prev["checked"] = frame_no - RECHECK_FRAMES + JUDGE_RETRY_FRAMES
                     else:
                         cache[track_id] = {"exclude": None, "checked": frame_no, "ok": None}
+                if first_negative:
+                    cache[track_id]["neg1"] = True                    # 다음 '다른 사람' 판정은 바로 확정한다
         if excluded is not True:                                      # 제외로 확정된 것만 뺀다
             kept.append(box)
     return kept
@@ -467,7 +481,8 @@ def _judge_face(img: np.ndarray, box: Box, ref: np.ndarray, threshold: float) ->
 
     판정: 등록 인물이면 True, 아니면 False, 판단할 수 없으면 None.
     유사도가 임계값 이상이면 얼굴이 돌아가 있어도 True 다. 임계값 미만인데 얼굴이 JUDGE_MAX_TURN 보다 많이 돌아가 있으면
-    옆얼굴은 같은 사람도 유사도가 크게 떨어지므로 '다른 사람'으로 단정하지 않고 (None, True) 로 판정을 미룬다. 얼굴을 못 찾았거나
+    옆얼굴은 같은 사람도 유사도가 크게 떨어지므로 '다른 사람'으로 단정하지 않고 (None, True) 로 판정을 미룬다. 정면이어도 유사도가
+    SIM_UNSURE_LOW 이상이면(흐림·조명으로 애매함) 같은 이유로 미룬다. 얼굴을 못 찾았거나
     오류가 났을 때는 (None, False). 어느 경우든 None 이면 호출하는 쪽이 모자이크를 유지한다.
     """
     try:
@@ -488,11 +503,14 @@ def _judge_face(img: np.ndarray, box: Box, ref: np.ndarray, threshold: float) ->
         emb = _face_embedding(face)
         if emb is None:
             return None, False
-        if float(np.max(ref @ emb)) >= threshold:
+        sim = float(np.max(ref @ emb))
+        if sim >= threshold:
             return True, False
         turn = _face_turn(face)
         if turn is not None and abs(turn) > JUDGE_MAX_TURN:
             return None, True                         # 옆얼굴: 낮은 유사도를 믿을 수 없다 -> 모자이크는 유지하되 나중에 다시 본다
+        if sim >= SIM_UNSURE_LOW:
+            return None, True                         # 애매한 유사도(흐림·조명): '다른 사람'으로 단정하지 않고 옆얼굴처럼 미룬다
         return False, False
     except Exception:    # 인식 중 오류는 '제외하지 않음'(모자이크 유지)으로 안전하게 처리하고 기록만 남긴다
         _log.exception("인물 판정 중 오류가 나서 이 박스는 모자이크합니다.")

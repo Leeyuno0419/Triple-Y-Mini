@@ -17,7 +17,7 @@ from typing import Callable, Optional
 import cv2
 import numpy as np
 
-from src.config import HOLD_FRAMES, UNTRACKED_HOLD_FRAMES, UNTRACKED_MATCH_IOU
+from src.config import HOLD_FRAMES, SCENE_CUT_CORR, UNTRACKED_HOLD_FRAMES, UNTRACKED_MATCH_IOU
 from src.types import Box
 
 
@@ -258,6 +258,23 @@ def merge_audio_h264(video_path: str, audio_src: str, out_path: str) -> None:
         encoded_temp.unlink(missing_ok=True)
 
 
+def _frame_thumb(frame: np.ndarray) -> np.ndarray:
+    """장면 전환 감지용: 프레임을 32x18 흑백으로 줄여 1차원 벡터로 반환한다."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.resize(gray, (32, 18), interpolation=cv2.INTER_AREA).astype(np.float32).ravel()
+
+
+def _is_scene_cut(prev_thumb: Optional[np.ndarray], thumb: np.ndarray) -> bool:
+    """앞 프레임과 밝기 구조의 상관계수가 SCENE_CUT_CORR 보다 낮으면 장면 전환으로 본다.
+
+    상관계수는 전체 밝기·대비 변화(무대 조명)에는 거의 변하지 않고, 화면 구성이 바뀔 때만 크게 떨어진다.
+    한쪽이 단색 화면이면 상관을 잴 수 없어 장면 전환으로 보지 않는다.
+    """
+    if prev_thumb is None or prev_thumb.std() < 1e-3 or thumb.std() < 1e-3:
+        return False
+    return float(np.corrcoef(prev_thumb, thumb)[0, 1]) < SCENE_CUT_CORR
+
+
 def _load_exclusion_filter():
     """제외 모듈이 있으면 필터를 반환하고, 모듈 부재는 None으로 알린다."""
     try:
@@ -315,7 +332,9 @@ def process_video(
 
     holder = BoxHolder()
     exclude_cache: dict = {}
-    track_ids: set[int] = set()
+    track_ids: set[tuple[int, int]] = set()    # (장면 번호, track_id): 장면 전환 때 track_id 가 1 부터 다시 매겨진다
+    scene = 0
+    prev_thumb: Optional[np.ndarray] = None
     processed_frames = 0
     start = time.perf_counter()
 
@@ -339,10 +358,20 @@ def process_video(
                     if frame.shape[1] != width or frame.shape[0] != height:
                         raise ValueError("영상 프레임의 해상도가 일정하지 않습니다.")
 
+                    # 장면이 바뀌면 이전 장면의 추적·유지 박스·제외 판정을 버린다.
+                    # (남겨 두면 빈 곳에 박스가 남고, 같은 자리에 나온 다른 사람이 '제외' 판정을 이어받을 수 있다)
+                    thumb = _frame_thumb(frame)
+                    if _is_scene_cut(prev_thumb, thumb):
+                        reset_tracker()
+                        holder = BoxHolder()
+                        exclude_cache.clear()
+                        scene += 1
+                    prev_thumb = thumb
+
                     boxes = detect_faces(frame, track=True)
                     for box in boxes:
                         if box["track_id"] is not None:
-                            track_ids.add(box["track_id"])
+                            track_ids.add((scene, box["track_id"]))
                     boxes = holder.update(boxes, processed_frames)
 
                     if filter_excluded is not None:
