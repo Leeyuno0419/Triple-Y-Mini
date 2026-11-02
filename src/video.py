@@ -17,7 +17,15 @@ from typing import Callable, Optional
 import cv2
 import numpy as np
 
-from src.config import HOLD_FRAMES, SCENE_CUT_CORR, UNTRACKED_HOLD_FRAMES, UNTRACKED_MATCH_IOU
+from src.config import (
+    HOLD_FRAMES,
+    SCENE_CUT_CORR,
+    SCENE_CUT_MIN_GAP,
+    SCENE_FLAT_STD,
+    SCENE_THUMB_SIZE,
+    UNTRACKED_HOLD_FRAMES,
+    UNTRACKED_MATCH_IOU,
+)
 from src.types import Box
 
 
@@ -261,7 +269,7 @@ def merge_audio_h264(video_path: str, audio_src: str, out_path: str) -> None:
 def _frame_thumb(frame: np.ndarray) -> np.ndarray:
     """장면 전환 감지용: 프레임을 32x18 흑백으로 줄여 1차원 벡터로 반환한다."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    return cv2.resize(gray, (32, 18), interpolation=cv2.INTER_AREA).astype(np.float32).ravel()
+    return cv2.resize(gray, SCENE_THUMB_SIZE, interpolation=cv2.INTER_AREA).astype(np.float32).ravel()
 
 
 def _is_scene_cut(prev_thumb: Optional[np.ndarray], thumb: np.ndarray) -> bool:
@@ -270,9 +278,34 @@ def _is_scene_cut(prev_thumb: Optional[np.ndarray], thumb: np.ndarray) -> bool:
     상관계수는 전체 밝기·대비 변화(무대 조명)에는 거의 변하지 않고, 화면 구성이 바뀔 때만 크게 떨어진다.
     한쪽이 단색 화면이면 상관을 잴 수 없어 장면 전환으로 보지 않는다.
     """
-    if prev_thumb is None or prev_thumb.std() < 1e-3 or thumb.std() < 1e-3:
+    if prev_thumb is None or prev_thumb.std() < SCENE_FLAT_STD or thumb.std() < SCENE_FLAT_STD:
         return False
     return float(np.corrcoef(prev_thumb, thumb)[0, 1]) < SCENE_CUT_CORR
+
+
+class _SceneCutDetector:
+    """프레임을 차례로 받아 장면 전환인지 판정한다 (process_video·process_stream 공용).
+
+    단색 화면(암전 등)은 비교 기준으로 삼지 않아, 암전 앞 화면과 뒤 화면을 비교한다.
+    전환 직후 min_gap 프레임 안에서 다시 잡힌 전환은 흔들림·잔상 효과로 보고 무시한다.
+    """
+
+    def __init__(self, min_gap: int = SCENE_CUT_MIN_GAP) -> None:
+        self.min_gap = min_gap
+        self._prev_thumb: Optional[np.ndarray] = None
+        self._frames_since_cut = min_gap  # 첫 전환은 바로 인정한다
+
+    def update(self, frame: np.ndarray) -> bool:
+        """이번 프레임이 장면 전환이면 True를 반환한다."""
+        self._frames_since_cut += 1
+        thumb = _frame_thumb(frame)
+        if thumb.std() < SCENE_FLAT_STD:
+            return False
+        cut = _is_scene_cut(self._prev_thumb, thumb) and self._frames_since_cut > self.min_gap
+        self._prev_thumb = thumb
+        if cut:
+            self._frames_since_cut = 0
+        return cut
 
 
 def _load_exclusion_filter():
@@ -295,7 +328,8 @@ def process_video(
     """영상의 얼굴을 추적·모자이크하고 결과 정보 dict를 반환한다.
 
     반환 키는 ``faces``, ``frames``, ``fps``, ``seconds``이다. ``faces``는
-    track ID가 있는 고유 인원 수이며, FPS와 시간은 출력 인코딩까지 포함한다.
+    장면별 고유 track ID 수의 합이며(장면이 바뀌면 같은 사람도 다시 센다),
+    FPS와 시간은 출력 인코딩까지 포함한다.
     """
     from src.detector import detect_faces, reset_tracker
     from src.mosaic import apply_mosaic
@@ -334,7 +368,7 @@ def process_video(
     exclude_cache: dict = {}
     track_ids: set[tuple[int, int]] = set()    # (장면 번호, track_id): 장면 전환 때 track_id 가 1 부터 다시 매겨진다
     scene = 0
-    prev_thumb: Optional[np.ndarray] = None
+    scene_cut = _SceneCutDetector()
     processed_frames = 0
     start = time.perf_counter()
 
@@ -360,13 +394,11 @@ def process_video(
 
                     # 장면이 바뀌면 이전 장면의 추적·유지 박스·제외 판정을 버린다.
                     # (남겨 두면 빈 곳에 박스가 남고, 같은 자리에 나온 다른 사람이 '제외' 판정을 이어받을 수 있다)
-                    thumb = _frame_thumb(frame)
-                    if _is_scene_cut(prev_thumb, thumb):
+                    if scene_cut.update(frame):
                         reset_tracker()
                         holder = BoxHolder()
                         exclude_cache.clear()
                         scene += 1
-                    prev_thumb = thumb
 
                     boxes = detect_faces(frame, track=True)
                     for box in boxes:
