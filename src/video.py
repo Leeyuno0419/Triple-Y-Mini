@@ -185,15 +185,28 @@ class BoxHolder:
         return current + held
 
 
+def _find_ffmpeg() -> Optional[str]:
+    """ffmpeg 경로를 반환한다. PATH에 없으면 imageio-ffmpeg에 들어 있는 실행 파일을 쓰고, 둘 다 없으면 None."""
+    found = shutil.which("ffmpeg")
+    if found is not None:
+        return found
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # 패키지가 없거나 실행 파일을 못 찾으면 ffmpeg 없음으로 본다
+        return None
+
+
 def merge_audio_h264(video_path: str, audio_src: str, out_path: str) -> None:
     """처리 영상에 원본의 오디오를 선택적으로 합치고 H.264 MP4로 저장한다.
 
     입력에 오디오 트랙이 없어도 영상만 출력한다. ffmpeg가 없거나 인코딩에
     실패하면 RuntimeError를 발생시킨다.
     """
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = _find_ffmpeg()
     if ffmpeg is None:
-        raise RuntimeError("ffmpeg를 찾을 수 없습니다. 설치 후 PATH에 등록해 주세요.")
+        raise RuntimeError("ffmpeg를 찾을 수 없습니다. imageio-ffmpeg를 설치하거나 ffmpeg를 PATH에 등록해 주세요.")
 
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
