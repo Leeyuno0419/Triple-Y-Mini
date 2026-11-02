@@ -18,7 +18,10 @@ import cv2
 import numpy as np
 
 from src.config import (
+    DETECT_PROGRESS,
+    DETECT_PROGRESS_EXCLUDE,
     HOLD_FRAMES,
+    MAX_FILL_GAP,
     SCENE_CUT_CORR,
     SCENE_CUT_MIN_GAP,
     SCENE_FLAT_STD,
@@ -26,6 +29,7 @@ from src.config import (
     UNTRACKED_HOLD_FRAMES,
     UNTRACKED_MATCH_IOU,
 )
+from src.track_fill import interpolate_gaps, stitch_tracks
 from src.types import Box
 
 
@@ -193,6 +197,58 @@ class BoxHolder:
         return current + held
 
 
+@dataclass
+class VideoAnalysis:
+    """영상을 한 번 처리한 뒤 남기는, 결과를 다시 만들 때 쓰는 값. 프레임 이미지는 담지 않아 가볍다.
+
+    boxes[f]            f번째 프레임의 박스(보간·박스 유지까지 끝났고 인물 제외 판정 전). track_id 는 탐지기가 준 원래 값이다.
+    auto_excluded[f]    f번째 프레임에서 등록 인물(ref_embs)이라 모자이크에서 빠진 박스의 위치(boxes[f] 안의 번호).
+    alias               끊겨서 새 ID 가 된 track -> 같은 사람으로 이어 붙인 대표 track. 사람 단위 편집(unmask·mask)에 쓴다.
+    """
+
+    boxes: list[list[Box]]
+    auto_excluded: list[frozenset]
+    alias: dict[int, int]
+    fps: float
+    width: int
+    height: int
+    cuts: frozenset = frozenset()    # 장면 전환(새 장면이 시작하는 프레임 번호). 참고용이다
+
+
+def person_of(analysis: VideoAnalysis, track_id: Optional[int]) -> Optional[int]:
+    """track_id 가 속한 사람 번호(끊긴 track 을 이어 붙인 대표 track). track_id 가 없으면 None."""
+    return None if track_id is None else analysis.alias.get(track_id, track_id)
+
+
+def visible_boxes(
+    analysis: VideoAnalysis,
+    frame_idx: int,
+    unmask: frozenset = frozenset(),
+    mask: frozenset = frozenset(),
+    regions: tuple = (),
+) -> list[Box]:
+    """frame_idx 프레임에서 실제로 가릴 박스 목록. 사진의 resolve_boxes 와 같은 규칙이다.
+
+    기본은 인물 제외가 빼지 않은 모든 박스다. 사람 번호가 unmask 에 있으면 그 사람의 박스를 가리지 않고(해제),
+    mask 에 있으면 등록 인물이어도 가린다(해제했던 것을 다시 가림). regions 의 (x1, y1, x2, y2) 는 모든 프레임에 같은 자리를 가리는 직접 영역이다.
+    ID 가 없는 박스는 사람 단위로 고를 수 없으므로 기본 규칙(등록 인물 판정)을 따른다.
+    """
+    auto = analysis.auto_excluded[frame_idx]
+    out: list[Box] = []
+    for i, box in enumerate(analysis.boxes[frame_idx]):
+        person = person_of(analysis, box["track_id"])
+        if person is not None and person in unmask:
+            continue
+        if (person is not None and person in mask) or i not in auto:
+            out.append(box)
+    for x1, y1, x2, y2 in regions:
+        x1, y1 = max(0, int(x1)), max(0, int(y1))
+        x2, y2 = min(analysis.width, int(x2)), min(analysis.height, int(y2))
+        if x2 - x1 >= 2 and y2 - y1 >= 2:
+            out.append({"xyxy": (x1, y1, x2, y2), "conf": 1.0, "track_id": None})
+    return out
+
+
 def _find_ffmpeg() -> Optional[str]:
     """ffmpeg 경로를 반환한다. PATH에 없으면 imageio-ffmpeg에 들어 있는 실행 파일을 쓰고, 둘 다 없으면 None."""
     found = shutil.which("ffmpeg")
@@ -319,20 +375,30 @@ def _load_exclusion_filter():
     return filter_excluded
 
 
-def process_video(
+def process_video_edit(
     in_path: str,
     out_path: str,
     ref_embs: Optional[np.ndarray] = None,
     on_progress: Optional[Callable[[float], None]] = None,
-) -> dict:
-    """영상의 얼굴을 추적·모자이크하고 결과 정보 dict를 반환한다.
+    effect: str = "mosaic",
+) -> tuple[dict, VideoAnalysis]:
+    """영상의 얼굴을 추적·가리고(모자이크 또는 블러) (결과 정보 dict, VideoAnalysis)를 반환한다.
 
+    VideoAnalysis 로 탐지 없이 결과를 다시 만들 수 있다(render_video). 정보 dict 만 필요하면 process_video 를 쓴다.
+
+    effect 는 ``"mosaic"``(기본) 또는 ``"blur"``이다. 그 밖의 값이면 ValueError.
+
+    영상을 두 번 읽는다. 1패스에서 탐지·추적만 해 박스를 모으고, 끊긴 공백을 앞뒤 박스로 보간한 뒤(src.track_fill),
+    2패스에서 박스 유지·인물 제외·모자이크·저장을 한다. 진행률은 1패스가 앞쪽 DETECT_PROGRESS(인물 제외를 쓰면 DETECT_PROGRESS_EXCLUDE)를 차지한다.
     반환 키는 ``faces``, ``frames``, ``fps``, ``seconds``이다. ``faces``는
-    장면별 고유 track ID 수의 합이며(장면이 바뀌면 같은 사람도 다시 센다),
-    FPS와 시간은 출력 인코딩까지 포함한다.
+    끊겨서 ID가 바뀐 track을 이어 붙인 뒤의 고유 인원 수이며, FPS와 시간은 출력 인코딩까지 포함한다.
     """
     from src.detector import detect_faces, reset_tracker
-    from src.mosaic import apply_mosaic
+    from src.mosaic import apply_blur, apply_mosaic
+
+    if effect not in ("mosaic", "blur"):
+        raise ValueError(f"effect는 'mosaic' 또는 'blur'여야 합니다: {effect}")
+    apply_effect = apply_blur if effect == "blur" else apply_mosaic
 
     in_file = Path(in_path)
     out_file = Path(out_path)
@@ -364,17 +430,65 @@ def process_video(
         capture.release()
         raise ValueError("영상의 프레임 속도 또는 해상도를 읽을 수 없습니다.")
 
+    # 인물 제외를 쓰면 2패스에서 얼굴 인식이 돌아 오래 걸리므로, 진행률에서 1패스의 몫을 줄여 막대가 멈춘 것처럼 보이지 않게 한다.
+    detect_share = DETECT_PROGRESS_EXCLUDE if filter_excluded is not None and len(ref_embs) > 0 else DETECT_PROGRESS
     holder = BoxHolder()
     exclude_cache: dict = {}
-    track_ids: set[tuple[int, int]] = set()    # (장면 번호, track_id): 장면 전환 때 track_id 가 1 부터 다시 매겨진다
-    scene = 0
+    track_ids: set[int] = set()
+    base_boxes: list[list[Box]] = []
+    auto_excluded: list[frozenset] = []
+    per_frame: list[list[Box]] = []
     scene_cut = _SceneCutDetector()
+    cut_frames: set[int] = set()    # 1패스에서 잡은 장면 전환. 보간과 2패스 초기화가 같은 컷을 쓰도록 여기서 한 번만 판정한다
+    id_offset = 0    # 장면이 바뀌어 추적기를 비우면 track_id 가 1 부터 다시 매겨지므로, 영상 전체에서 겹치지 않게 이어 붙이는 값
+    max_track_id = 0
     processed_frames = 0
     start = time.perf_counter()
 
     try:
         if on_progress is not None:
             on_progress(0.0)
+
+        # 1패스: 탐지·추적만 한다. 프레임 이미지는 쌓지 않고 박스 목록만 모은다.
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            if frame.shape[1] != width or frame.shape[0] != height:
+                raise ValueError("영상 프레임의 해상도가 일정하지 않습니다.")
+
+            if scene_cut.update(frame):
+                # 장면이 바뀌면 추적기를 비운다. (남겨 두면 이전 장면의 번호가 같은 자리에 나온 다른 사람에게 붙는다)
+                reset_tracker()
+                id_offset = max_track_id
+                cut_frames.add(len(per_frame))
+
+            boxes = detect_faces(frame, track=True)
+            for box in boxes:
+                if box["track_id"] is not None:
+                    box["track_id"] += id_offset    # 추적기를 비우면 번호가 1 부터 다시 매겨지니 영상 전체에서 겹치지 않게 이어 붙인다
+                    max_track_id = max(max_track_id, box["track_id"])
+                    track_ids.add(box["track_id"])
+            per_frame.append(boxes)
+
+            if on_progress is not None and total_frames > 0:
+                on_progress(min(len(per_frame) / total_frames, 1.0) * detect_share)
+        capture.release()
+
+        if not per_frame:
+            raise ValueError("영상에서 처리할 프레임을 읽지 못했습니다.")
+
+        # 뒤쪽 박스까지 알고 나서, 끊긴 공백을 앞뒤 박스로 보간한다. track_id 는 바꾸지 않고 대응표로만 인원 수를 센다.
+        # 장면 전환을 가로질러 잇거나 채우면 다른 장면의 허공·몸통에 박스가 생기므로, 컷에서는 끊는다.
+        cuts = frozenset(cut_frames)
+        alias = stitch_tracks(per_frame, MAX_FILL_GAP, cuts=cuts)
+        per_frame, _ = interpolate_gaps(per_frame, alias, MAX_FILL_GAP, cuts=cuts)
+        faces = len({alias.get(track_id, track_id) for track_id in track_ids})
+
+        # 2패스: 영상을 다시 열어 박스 유지 -> 인물 제외 -> 모자이크 -> 저장
+        capture = cv2.VideoCapture(str(in_file))
+        if not capture.isOpened():
+            raise ValueError("영상을 다시 열 수 없습니다. 처리 중 파일이 바뀌었는지 확인해 주세요.")
         with tempfile.TemporaryDirectory(prefix="triple_y_video_") as temp_dir:
             intermediate = Path(temp_dir) / "mosaiced.mp4"
             writer = cv2.VideoWriter(
@@ -389,36 +503,30 @@ def process_video(
                     ok, frame = capture.read()
                     if not ok:
                         break
-                    if frame.shape[1] != width or frame.shape[0] != height:
-                        raise ValueError("영상 프레임의 해상도가 일정하지 않습니다.")
+                    if processed_frames >= len(per_frame):
+                        raise ValueError("영상을 다시 읽는 중 프레임 수가 달라졌습니다.")  # 박스 없이 내보내면 얼굴이 노출된다
 
-                    # 장면이 바뀌면 이전 장면의 추적·유지 박스·제외 판정을 버린다.
-                    # (남겨 두면 빈 곳에 박스가 남고, 같은 자리에 나온 다른 사람이 '제외' 판정을 이어받을 수 있다)
-                    if scene_cut.update(frame):
-                        reset_tracker()
-                        holder = BoxHolder()
-                        exclude_cache.clear()
-                        scene += 1
-
-                    boxes = detect_faces(frame, track=True)
-                    for box in boxes:
-                        if box["track_id"] is not None:
-                            track_ids.add((scene, box["track_id"]))
-                    boxes = holder.update(boxes, processed_frames)
-
+                    if processed_frames in cuts:
+                        holder = BoxHolder()    # 새 장면이니 이전 장면에서 유지하던 박스를 버린다
+                        exclude_cache.clear()    # 이전 장면의 제외 판정도 버린다 (같은 자리에 나온 다른 사람이 '제외'를 이어받지 않게)
+                    held_boxes = holder.update(per_frame[processed_frames], processed_frames)
+                    boxes = held_boxes
                     if filter_excluded is not None:
-                        boxes = filter_excluded(frame, boxes, ref_embs, cache=exclude_cache)
-                    writer.write(apply_mosaic(frame, boxes))
+                        boxes = filter_excluded(frame, held_boxes, ref_embs, cache=exclude_cache)
+                    kept_ids = {id(box) for box in boxes}    # filter_excluded 는 남긴 박스를 같은 객체로 돌려준다
+                    base_boxes.append(held_boxes)
+                    auto_excluded.append(frozenset(i for i, box in enumerate(held_boxes) if id(box) not in kept_ids))
+                    writer.write(apply_effect(frame, boxes))
                     processed_frames += 1
 
-                    if on_progress is not None and total_frames > 0:
-                        on_progress(min(processed_frames / total_frames, 1.0))
+                    if on_progress is not None:
+                        on_progress(detect_share + (1.0 - detect_share) * processed_frames / len(per_frame))
             finally:
                 writer.release()
                 capture.release()
 
-            if processed_frames == 0:
-                raise ValueError("영상에서 처리할 프레임을 읽지 못했습니다.")
+            if processed_frames != len(per_frame):
+                raise ValueError("영상을 다시 읽는 중 프레임 수가 달라졌습니다.")
 
             merge_audio_h264(str(intermediate), str(in_file), str(out_file))
     except Exception:
@@ -429,8 +537,101 @@ def process_video(
         on_progress(1.0)
 
     seconds = time.perf_counter() - start
+    info = {
+        "faces": faces,
+        "frames": processed_frames,
+        "fps": processed_frames / seconds if seconds > 0 else 0.0,
+        "seconds": seconds,
+    }
+    return info, VideoAnalysis(base_boxes, auto_excluded, alias, fps_src, width, height, cuts)
+
+
+def process_video(
+    in_path: str,
+    out_path: str,
+    ref_embs: Optional[np.ndarray] = None,
+    on_progress: Optional[Callable[[float], None]] = None,
+    effect: str = "mosaic",
+) -> dict:
+    """영상의 얼굴을 추적·가리고(모자이크 또는 블러) 결과 정보 dict를 반환한다. 자세한 동작은 process_video_edit 와 같다."""
+    info, _ = process_video_edit(in_path, out_path, ref_embs, on_progress, effect)
+    return info
+
+
+def render_video(
+    in_path: str,
+    out_path: str,
+    analysis: VideoAnalysis,
+    effect: str = "mosaic",
+    unmask: frozenset = frozenset(),
+    mask: frozenset = frozenset(),
+    regions: tuple = (),
+    on_progress: Optional[Callable[[float], None]] = None,
+) -> dict:
+    """process_video_edit 가 남긴 analysis 로 얼굴을 다시 찾지 않고 결과 영상을 다시 만든다. 반환 키는 process_video 와 같다.
+
+    unmask 는 가리지 않을 사람 번호, mask 는 등록 인물이어도 가릴 사람 번호, regions 는 모든 프레임에 가릴 직접 영역
+    (x1, y1, x2, y2 원본 픽셀)이다. 규칙은 visible_boxes 를 보라. 영상을 읽어 가리고 저장하는 일뿐이라 처리보다 훨씬 빠르다.
+    읽은 프레임 수가 analysis 와 다르면 ValueError (박스 없이 내보내면 얼굴이 노출된다).
+    """
+    from src.mosaic import apply_blur, apply_mosaic
+
+    if effect not in ("mosaic", "blur"):
+        raise ValueError(f"effect는 'mosaic' 또는 'blur'여야 합니다: {effect}")
+    apply_effect = apply_blur if effect == "blur" else apply_mosaic
+    in_file, out_file = Path(in_path), Path(out_path)
+    if not in_file.is_file():
+        raise ValueError(f"입력 영상을 찾을 수 없습니다: {in_path}")
+    if in_file.resolve() == out_file.resolve():
+        raise ValueError("출력 경로는 입력 영상 경로와 달라야 합니다.")
+
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    capture = cv2.VideoCapture(str(in_file))
+    if not capture.isOpened():
+        capture.release()
+        raise ValueError("영상을 열 수 없습니다. 파일이 깨졌는지 확인해 주세요.")
+
+    total = len(analysis.boxes)
+    persons: set[int] = set()
+    processed_frames = 0
+    start = time.perf_counter()
+    try:
+        if on_progress is not None:
+            on_progress(0.0)
+        with tempfile.TemporaryDirectory(prefix="triple_y_video_") as temp_dir:
+            intermediate = Path(temp_dir) / "mosaiced.mp4"
+            writer = cv2.VideoWriter(
+                str(intermediate), cv2.VideoWriter_fourcc(*"mp4v"), analysis.fps, (analysis.width, analysis.height)
+            )
+            if not writer.isOpened():
+                writer.release()
+                raise RuntimeError("처리 영상을 저장할 코덱을 열 수 없습니다.")
+            try:
+                while True:
+                    ok, frame = capture.read()
+                    if not ok:
+                        break
+                    if processed_frames >= total or frame.shape[1] != analysis.width or frame.shape[0] != analysis.height:
+                        raise ValueError("영상을 다시 읽는 중 프레임 수나 크기가 달라졌습니다.")
+                    boxes = visible_boxes(analysis, processed_frames, unmask, mask, regions)
+                    persons.update(p for p in (person_of(analysis, box["track_id"]) for box in boxes) if p is not None)
+                    writer.write(apply_effect(frame, boxes))
+                    processed_frames += 1
+                    if on_progress is not None:
+                        on_progress(min(processed_frames / total, 1.0))
+            finally:
+                writer.release()
+                capture.release()
+            if processed_frames != total:
+                raise ValueError("영상을 다시 읽는 중 프레임 수가 달라졌습니다.")
+            merge_audio_h264(str(intermediate), str(in_file), str(out_file))
+    except Exception:
+        capture.release()
+        raise
+
+    seconds = time.perf_counter() - start
     return {
-        "faces": len(track_ids),
+        "faces": len(persons),
         "frames": processed_frames,
         "fps": processed_frames / seconds if seconds > 0 else 0.0,
         "seconds": seconds,

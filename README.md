@@ -32,13 +32,14 @@ pip install -r requirements.txt
 ```
 - `requirements.txt`는 패키지를 추가할 때 버전과 함께 적는다.
 - YouTube 실시간 스트림용 `yt-dlp`와 ONNX·protobuf 호환 버전도 포함되어 있으므로, 별도 패키지 설치 없이 위의 `pip install -r requirements.txt` 한 번으로 준비한다.
+- **유튜브 라이브가 `스트림 연결에 실패했습니다`로 안 열리면:** 기본 `yt-dlp`(Python 3.8 최종판 2024.10.22)는 유튜브가 거절한다. Python 3.9 이상이 있으면 `python tools\setup_ytdlp.py` 로 최신 `yt-dlp` 전용 환경(`.venv-ytdlp`, git 제외)을 만들 수 있고, 앱은 그 환경이 있으면 자동으로 쓴다. 팀의 `.venv`(3.8)는 바꾸지 않는다.
 - 영상 소리 병합에 ffmpeg가 필요하다. Colab·리눅스 서버는 기본 제공, Windows는 별도 설치 후 PATH에 등록한다.
 - 비밀키·API 키는 프로젝트 루트의 `.env`에 둔다 (git 제외).
 - 데이터와 가중치(`best.pt`)는 git에 올리지 않으므로 팀 공유 폴더(Drive·서버)에서 받는다.
 - 기획서를 고친 뒤 PDF 재생성: `python tools\md_to_pdf.py 기획서.md 기획서.pdf` (reportlab, 맑은 고딕 글꼴 필요)
 
 ## 얼굴 탐지 모델 준비 (`detect_faces`)
-지금은 사전학습 가중치 [yolov11n-face](https://github.com/akanametov/yolo-face) (WIDER FACE로 학습, GPL-3.0)를 `weights\best.pt`로 쓴다. 직접 학습을 하기로 해서 모델이 나오면 A가 `best.pt`만 교체한다.
+사전학습 가중치 [yolov11n-face](https://github.com/akanametov/yolo-face) (WIDER FACE로 학습, GPL-3.0)를 `weights\best.pt`로 쓴다. 사전학습 모델로 얼굴 탐지가 충분해 직접 학습은 하지 않기로 했다 (11-02).
 ```powershell
 Invoke-WebRequest https://github.com/akanametov/yolo-face/releases/download/1.0.0/yolov11n-face.pt -OutFile weights\best.pt
 ```
