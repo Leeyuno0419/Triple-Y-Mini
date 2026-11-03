@@ -220,26 +220,39 @@ def person_of(analysis: VideoAnalysis, track_id: Optional[int]) -> Optional[int]
     return None if track_id is None else analysis.alias.get(track_id, track_id)
 
 
-def visible_boxes(
-    analysis: VideoAnalysis,
-    frame_idx: int,
-    unmask: frozenset = frozenset(),
-    mask: frozenset = frozenset(),
-    regions: tuple = (),
-) -> list[Box]:
+def edits_at(edits: tuple, frame_idx: int) -> tuple[dict, list]:
+    """frame_idx 프레임에 걸리는 편집을 정리한다. (사람 번호 -> "unmask" | "mask", 이 프레임에서 가릴 직접 영역 목록)
+
+    edits 는 (start, end, kind, value) 의 순서 있는 목록이고 start~end 프레임(양끝 포함)에만 적용된다. 같은 대상은 뒤의 편집이 앞을 덮는다.
+      kind "unmask" / "mask"     : value 는 사람 번호. 그 사람을 가리지 않음 / 등록 인물이어도 가림.
+      kind "region" / "unregion" : value 는 (x1, y1, x2, y2) 원본 픽셀. 그 자리를 가림(직접 영역) / 그 직접 영역을 뺌.
+    """
+    decision: dict[int, str] = {}
+    regions: dict[tuple, bool] = {}    # 순서를 지키려고 dict 를 쓴다
+    for start, end, kind, value in edits:
+        if start <= frame_idx <= end:
+            if kind in ("unmask", "mask"):
+                decision[value] = kind
+            else:
+                regions[tuple(value)] = kind == "region"
+    return decision, [region for region, on in regions.items() if on]
+
+
+def visible_boxes(analysis: VideoAnalysis, frame_idx: int, edits: tuple = ()) -> list[Box]:
     """frame_idx 프레임에서 실제로 가릴 박스 목록. 사진의 resolve_boxes 와 같은 규칙이다.
 
-    기본은 인물 제외가 빼지 않은 모든 박스다. 사람 번호가 unmask 에 있으면 그 사람의 박스를 가리지 않고(해제),
-    mask 에 있으면 등록 인물이어도 가린다(해제했던 것을 다시 가림). regions 의 (x1, y1, x2, y2) 는 모든 프레임에 같은 자리를 가리는 직접 영역이다.
+    기본은 인물 제외가 빼지 않은 모든 박스다. 이 프레임에 걸린 편집(edits_at)에서 사람이 "unmask" 면 그 사람의 박스를 가리지 않고(해제),
+    "mask" 면 등록 인물이어도 가린다(해제했던 것을 다시 가림). 직접 영역 (x1, y1, x2, y2) 은 그 자리를 가린다.
     ID 가 없는 박스는 사람 단위로 고를 수 없으므로 기본 규칙(등록 인물 판정)을 따른다.
     """
     auto = analysis.auto_excluded[frame_idx]
+    decision, regions = edits_at(edits, frame_idx)
     out: list[Box] = []
     for i, box in enumerate(analysis.boxes[frame_idx]):
         person = person_of(analysis, box["track_id"])
-        if person is not None and person in unmask:
+        if person is not None and decision.get(person) == "unmask":
             continue
-        if (person is not None and person in mask) or i not in auto:
+        if (person is not None and decision.get(person) == "mask") or i not in auto:
             out.append(box)
     for x1, y1, x2, y2 in regions:
         x1, y1 = max(0, int(x1)), max(0, int(y1))
@@ -563,15 +576,13 @@ def render_video(
     out_path: str,
     analysis: VideoAnalysis,
     effect: str = "mosaic",
-    unmask: frozenset = frozenset(),
-    mask: frozenset = frozenset(),
-    regions: tuple = (),
+    edits: tuple = (),
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> dict:
     """process_video_edit 가 남긴 analysis 로 얼굴을 다시 찾지 않고 결과 영상을 다시 만든다. 반환 키는 process_video 와 같다.
 
-    unmask 는 가리지 않을 사람 번호, mask 는 등록 인물이어도 가릴 사람 번호, regions 는 모든 프레임에 가릴 직접 영역
-    (x1, y1, x2, y2 원본 픽셀)이다. 규칙은 visible_boxes 를 보라. 영상을 읽어 가리고 저장하는 일뿐이라 처리보다 훨씬 빠르다.
+    edits 는 구간별 편집 (start, end, kind, value) 목록이다(사람 해제·다시 가림, 직접 영역 추가·빼기). 형식과 규칙은 edits_at·visible_boxes 를 보라.
+    영상을 읽어 가리고 저장하는 일뿐이라 처리보다 훨씬 빠르다.
     읽은 프레임 수가 analysis 와 다르면 ValueError (박스 없이 내보내면 얼굴이 노출된다).
     """
     from src.mosaic import apply_blur, apply_mosaic
@@ -613,7 +624,7 @@ def render_video(
                         break
                     if processed_frames >= total or frame.shape[1] != analysis.width or frame.shape[0] != analysis.height:
                         raise ValueError("영상을 다시 읽는 중 프레임 수나 크기가 달라졌습니다.")
-                    boxes = visible_boxes(analysis, processed_frames, unmask, mask, regions)
+                    boxes = visible_boxes(analysis, processed_frames, edits)
                     persons.update(p for p in (person_of(analysis, box["track_id"]) for box in boxes) if p is not None)
                     writer.write(apply_effect(frame, boxes))
                     processed_frames += 1
