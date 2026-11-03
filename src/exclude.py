@@ -553,6 +553,26 @@ def embed_face(img: np.ndarray, xyxy: tuple[int, int, int, int]) -> Optional[dic
         return None
 
 
+def embed_track(shots: list[tuple[np.ndarray, tuple[int, int, int, int]]]) -> Optional[dict]:
+    """한 사람이 찍힌 여러 장면 [(img(BGR), xyxy), ...] 에서 인물 등록용 후보를 만든다. embed_face 와 같은 모양이고 embs 가 (k, d) 다. 쓸 수 없으면 None.
+
+    영상에서 얼굴을 클릭했을 때, 그 장면 한 장이 아니라 같은 track 의 여러 장면으로 여러 각도의 벡터를 모으려고 쓴다.
+    shots[0] 은 사용자가 클릭한 장면이다. 장면마다 embed_face 로 벡터를 만들고(작은 얼굴·옆얼굴은 빠진다), 기준 벡터와 유사도가
+    SIM_THRESHOLD 미만인 것은 버린다(추적이 다른 사람으로 넘어간 장면이 섞여 다른 사람이 제외되지 않게). 기준은 클릭한 장면의 벡터이고,
+    그 장면에서 벡터를 못 만들면 가장 또렷한 장면의 벡터다. 남은 것 중 REF_MAX_EMBS 개를 _pick_diverse 로 각도가 다르게 고른다.
+    """
+    tried = [embed_face(img, xyxy) for img, xyxy in shots]
+    made = [cand for cand in tried if cand is not None]
+    if not made:
+        return None
+    anchor = tried[0] if tried[0] is not None else max(made, key=lambda c: c["score"])
+    ref = anchor["embs"][0]
+    same = [c for c in made if float(c["embs"][0] @ ref) >= SIM_THRESHOLD]
+    members = _pick_diverse([(c["score"], c["embs"][0]) for c in same], REF_MAX_EMBS)
+    return {"thumb": anchor["thumb"], "embs": np.stack([emb for _, emb in members]).astype(np.float32),
+            "frames": len(same), "score": anchor["score"]}
+
+
 def _judge(img: np.ndarray, box: Box, ref: np.ndarray, threshold: float) -> Optional[bool]:
     """박스 안의 얼굴이 등록 인물이면 True, 아니면 False, 판단할 수 없으면 None 을 돌려준다. (_judge_face 의 판정만)"""
     return _judge_face(img, box, ref, threshold)[0]
