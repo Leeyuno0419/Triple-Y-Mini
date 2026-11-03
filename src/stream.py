@@ -295,15 +295,43 @@ def sample_stream_frames(url: str, dest_dir: str, count: int = STREAM_CAPTURE_FR
     return paths
 
 
+def _emb_rows(embs: Optional[np.ndarray]) -> set[bytes]:
+    """등록 벡터들을 행(사람의 얼굴 벡터 하나) 단위로 비교할 수 있게 바이트 집합으로 만든다. None 이면 빈 집합."""
+    return set() if embs is None else {np.ascontiguousarray(row).tobytes() for row in np.asarray(embs)}
+
+
+def _drop_stale_verdicts(cache: dict, old: Optional[np.ndarray], new: Optional[np.ndarray]) -> None:
+    """등록이 old -> new 로 바뀌었을 때 제외 cache 에서 더는 믿을 수 없는 track 판정만 지운다. (cache 모양은 src/exclude.py 의 filter_excluded)
+
+    - 추가만 (new 가 old 의 벡터를 모두 가짐): '제외' 판정은 남긴다. 계속 등록된 사람이 다시 가려지지 않게 한다.
+      나머지('다른 사람'·판정 보류)는 새로 등록한 사람일 수 있어 지우고 바로 다시 판정한다.
+    - 해제만 (old 가 new 의 벡터를 모두 가짐): '제외' 판정을 지운다. 어느 track 이 해제한 사람인지 모르므로, 남은 사람도 다시 판정한다.
+      '다른 사람' 판정은 남긴다 (더 적은 사람과도 맞을 리 없다).
+    - 둘 다 바뀜: 모두 지운다.
+    """
+    old_rows, new_rows = _emb_rows(old), _emb_rows(new)
+    if new_rows >= old_rows:
+        stale = (False, None)
+    elif new_rows <= old_rows:
+        stale = (True, None)
+    else:
+        stale = (True, False, None)
+    for key in [k for k, entry in cache.items() if isinstance(entry, dict) and entry["exclude"] in stale]:
+        del cache[key]    # cache["_frame"](부른 횟수)는 판정이 아니라 그대로 둔다
+
+
 def process_stream(
     url: str,
-    ref_embs: Optional[np.ndarray] = None,
+    ref_embs: Union[Optional[np.ndarray], Callable[[], Optional[np.ndarray]]] = None,
     effect: Union[str, Callable[[], str]] = "mosaic",
     should_stop: Optional[Callable[[], bool]] = None,
 ) -> Iterator[tuple[np.ndarray, dict]]:
     """Yield BGR frames with faces mosaiced (or blurred when effect is "blur") and live counts. The capture worker retains only its newest frame.
 
     `effect` may be a function returning "mosaic" or "blur"; it is asked again for every frame, so the effect can change while the stream runs.
+    `ref_embs` may likewise be a function returning the registered face vectors (or None); when it returns a different object,
+    the verdicts that may no longer hold are dropped (see `_drop_stale_verdicts`), so a removed person is masked again from the next frame
+    while people who stay registered are not masked again.
     `should_stop` is polled at least every 0.5 s (even when no frame arrives) and ends the generator when it returns True.
     The yielded info dict also carries the untouched source frame as "original" (BGR) for a side-by-side view.
     """
@@ -318,7 +346,11 @@ def process_stream(
 
     effect_now()    # fail at the start, not on the first frame
     source = resolve_stream_url(url)
-    filter_excluded = _load_exclusion_filter() if ref_embs is not None else None
+    def refs_now() -> Optional[np.ndarray]:
+        return ref_embs() if callable(ref_embs) else ref_embs
+
+    last_refs = refs_now()
+    filter_excluded = _load_exclusion_filter() if last_refs is not None else None    # fail at the start when registered from the beginning
     reset_tracker()
     lock = threading.Lock()
     changed = threading.Event()
@@ -455,8 +487,14 @@ def process_stream(
                     ]
                 track_ids.update((scene, b["track_id"]) for b in boxes if b["track_id"] is not None)
                 boxes = holder.update(boxes, frame_idx)
-                if filter_excluded is not None:
-                    boxes = filter_excluded(frame, boxes, ref_embs, cache=exclude_cache)
+                refs = refs_now()
+                if refs is not last_refs:    # 등록이 바뀌었다: 더는 믿을 수 없는 판정만 버린다
+                    _drop_stale_verdicts(exclude_cache, last_refs, refs)
+                    last_refs = refs
+                if refs is not None:
+                    if filter_excluded is None:
+                        filter_excluded = _load_exclusion_filter()
+                    boxes = filter_excluded(frame, boxes, refs, cache=exclude_cache)
                 apply_effect = apply_blur if effect_now() == "blur" else apply_mosaic
                 result = apply_effect(frame, boxes)
                 processed += 1

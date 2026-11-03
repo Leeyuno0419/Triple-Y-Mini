@@ -24,6 +24,7 @@ STREAM_IDLE_STOP = 10           # 화면(브라우저)에서 이 시간(초) 동
 LIVE_VIEW_REFRESH = 0.25        # 실시간 화면이 새 프레임을 가져오는 간격(초) (C)
 STREAM_CAPTURE_FRAMES = 8       # 제외할 얼굴을 고르려고 실시간 스트림에서 미리 자동 캡처하는 장면 수 (B)
 STREAM_CAPTURE_INTERVAL = 1.0   # 그 장면들 사이의 간격(초). 모두 모으는 데 대략 FRAMES x INTERVAL 초가 걸린다 (B)
+STREAM_RECENT_FRAMES = 30       # 실시간 처리 중 STREAM_CAPTURE_INTERVAL 초마다 원본 장면을 보관하는 최대 장수. 처리 중에 제외할 얼굴을 찾을 때 이 장면들(약 30초)과 지금 화면을 쓴다 (11-03, A)
 FILL_DUP_IOU = 0.3            # 보간 박스가 그 프레임의 기존 박스와 IoU 가 이 이상이면 이미 덮여 있다고 보고 만들지 않는다 (B)
 DETECT_PROGRESS = 0.85        # process_video 진행률(0~1) 중 1패스(탐지·추적)가 차지하는 몫. 나머지는 2패스(모자이크·저장). 인물 제외를 끈 전체 길이 영상(1050프레임)에서 실측: 1패스가 시간의 0.86 (B)
 DETECT_PROGRESS_EXCLUDE = 0.3  # 위와 같되 인물 제외(ref_embs)를 켰을 때. 2패스에서 얼굴 인식이 돌아 실측으로 1패스가 시간의 0.31 뿐이라, 0.85 로 두면 막대가 85%에서 멈춘 것처럼 보인다 (B)
