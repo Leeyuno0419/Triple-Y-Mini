@@ -63,7 +63,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.config import LIVE_VIEW_REFRESH, MAX_VIDEO_SECONDS, MAX_VIDEO_SHORT_SIDE, PAD, SIM_THRESHOLD, STREAM_CAPTURE_INTERVAL, STREAM_IDLE_STOP, STREAM_RECENT_FRAMES    # 영상 제한(1분·720p)과 블러 여백은 공통 설정 파일에서 읽는다
+from src.config import LIVE_VIEW_REFRESH, MAX_VIDEO_SECONDS, MAX_VIDEO_SHORT_SIDE, MIN_VERIFY_SIZE, PAD, PICK_TRACK_FRAMES, SIM_THRESHOLD, STREAM_CAPTURE_INTERVAL, STREAM_IDLE_STOP, STREAM_RECENT_FRAMES    # 영상 제한(1분·720p)과 블러 여백은 공통 설정 파일에서 읽는다
 
 # ============================================================
 # 1. 기본 설정
@@ -1848,8 +1848,9 @@ def sync_pick_registrations(mode: str, files: list[UploadedFile]) -> None:
     인물 등록 카드를 그리기 전에 불러서, 클릭한 바로 그 화면에서 등록 상태가 같이 바뀌게 한다. 처음부터 등록 인물이라 자동 제외된 얼굴은
     건드리지 않는다. 올린 사람은 origin == "pick" 이고, 다음에 처리할 때부터 자동으로 제외된다. 작은 얼굴이나 옆얼굴처럼 믿을 만한 벡터를
     못 만드는 얼굴은 그 장면에서만 제외되고 등록되지 않는다. (src/exclude.py 의 embed_face)
+    영상은 클릭한 장면 한 장이 아니라 그 사람(track)의 여러 장면에서 여러 각도의 벡터를 모은다. (person_shots → embed_track)
     """
-    from src.exclude import embed_face
+    from src.exclude import embed_face, embed_track
 
     people = st.session_state["ref_people"]
     failed: set = st.session_state.setdefault("pick_failed", set())    # 벡터를 못 만든 얼굴은 화면을 다시 그릴 때마다 시도하지 않는다
@@ -1891,22 +1892,39 @@ def sync_pick_registrations(mode: str, files: list[UploadedFile]) -> None:
                     continue
                 xyxy = tuple(int(v) for v in detected["xyxy"])
                 settle(("pickv", files[0].file_id, person), edit["decision"].get(person) == "unmask",
-                       lambda xyxy=xyxy, frame=view["frame"]: embed_face(read_video_frame_bgr(files[0], frame), xyxy))
+                       lambda person=person, xyxy=xyxy, frame=view["frame"]: embed_track(person_shots(files[0], edit["analysis"], person, frame, xyxy)))
     if changed:
         sync_ref_embs()
 
 
-def read_video_frame_bgr(uploaded: UploadedFile, frame_idx: int) -> np.ndarray:
-    """업로드한 영상(이 접속의 임시 폴더에 저장된 입력 파일)의 frame_idx 번째 프레임(BGR)."""
+def person_shots(uploaded: UploadedFile, analysis: object, person: int, frame: int, xyxy: tuple) -> list[tuple[np.ndarray, tuple]]:
+    """영상에서 클릭한 사람이 찍힌 장면들 [(프레임 BGR, 얼굴 박스), ...]. 맨 앞은 클릭한 장면이고, 나머지는 그 사람의 다른 장면 중
+    짧은 변이 MIN_VERIFY_SIZE 이상인 것에서 영상 전체에 고르게 PICK_TRACK_FRAMES - 1 장을 고른다. (src/exclude.py 의 embed_track 에 넘긴다)
+    """
+    from src.video import person_of
+
+    spots = [(f, tuple(int(v) for v in box["xyxy"])) for f, boxes in enumerate(analysis.boxes) if f != frame for box in boxes
+             if person_of(analysis, box["track_id"]) == person and min(box["xyxy"][2] - box["xyxy"][0], box["xyxy"][3] - box["xyxy"][1]) >= MIN_VERIFY_SIZE]
+    count = min(len(spots), PICK_TRACK_FRAMES - 1)
+    picked = [spots[i * len(spots) // count] for i in range(count)] if count else []    # 시간 순으로 고르게 (각도가 다양해지게)
+    frames = read_video_frames_bgr(uploaded, [frame] + [f for f, _ in picked])
+    return [(frames[0], xyxy)] + [(img, box) for img, (_, box) in zip(frames[1:], picked) if img is not None]
+
+
+def read_video_frames_bgr(uploaded: UploadedFile, frame_idxs: list[int]) -> list[Optional[np.ndarray]]:
+    """업로드한 영상의 여러 프레임(BGR)을 영상을 한 번만 열어 읽는다. 첫 프레임을 못 읽으면 ValueError, 나머지는 못 읽으면 None."""
     cap = cv2.VideoCapture(str(get_workdir() / f"input{Path(uploaded.name).suffix.lower()}"))
+    frames: list[Optional[np.ndarray]] = []
     try:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ok, frame = cap.read()
+        for frame_idx in frame_idxs:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, img = cap.read()
+            frames.append(img if ok else None)
     finally:
         cap.release()
-    if not ok:
+    if not frame_idxs or frames[0] is None:
         raise ValueError("영상에서 이 장면을 읽을 수 없습니다.")
-    return frame
+    return frames
 
 
 def render_file_tab() -> None:
