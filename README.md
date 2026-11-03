@@ -8,7 +8,7 @@ YOLO를 활용한 얼굴 자동 모자이크 서비스 (3인, 2주).
 - 함수 입출력·데이터 타입 규칙: [역할별_구현명세.md](역할별_구현명세.md)
 
 ## 핵심 기술
-YOLO11(ultralytics), ByteTrack, OpenCV, ffmpeg, yt-dlp, InsightFace, 웹 데모(Streamlit·Gradio·Vercel 중 선택)
+YOLO11(ultralytics), ByteTrack, OpenCV, ffmpeg, yt-dlp, InsightFace, 웹 데모(Streamlit)
 
 ## 폴더 구조
 ```

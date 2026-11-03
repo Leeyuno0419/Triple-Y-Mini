@@ -63,7 +63,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.config import LIVE_VIEW_REFRESH, MAX_VIDEO_SECONDS, MAX_VIDEO_SHORT_SIDE, PAD, SIM_THRESHOLD, STREAM_CAPTURE_INTERVAL, STREAM_IDLE_STOP, STREAM_RECENT_FRAMES    # 영상 제한(1분·720p)과 블러 여백은 공통 설정 파일에서 읽는다
+from src.config import LIVE_VIEW_REFRESH, MAX_VIDEO_SECONDS, MAX_VIDEO_SHORT_SIDE, MIN_VERIFY_SIZE, PAD, PICK_TRACK_FRAMES, SIM_THRESHOLD, STREAM_CAPTURE_INTERVAL, STREAM_IDLE_STOP, STREAM_RECENT_FRAMES    # 영상 제한(1분·720p)과 블러 여백은 공통 설정 파일에서 읽는다
 
 # ============================================================
 # 1. 기본 설정
@@ -1533,14 +1533,14 @@ def on_video_rerender(
     video_path: str,
     analysis: object,
     effect: str,
-    unmask: frozenset,
-    mask: frozenset,
-    regions: tuple,
+    edits: tuple,
     version: int,
     on_progress: Optional[Callable[[float], None]] = None,
     on_wait: Optional[Callable[[int], None]] = None,
 ) -> tuple[str, dict]:
-    """이미 처리한 영상을 얼굴을 다시 찾지 않고 편집 내용(해제·다시 가림·직접 영역)과 가리는 방식대로 다시 만든다. (결과 영상 경로, 정보 dict)
+    """이미 처리한 영상을 얼굴을 다시 찾지 않고 구간별 편집 내용(해제·다시 가림·직접 영역)과 가리는 방식대로 다시 만든다. (결과 영상 경로, 정보 dict)
+
+    edits 는 (start, end, kind, value) 목록이다. 형식은 src/video.py 의 edits_at 를 보라.
 
     version 은 결과 파일 이름에 붙여, 브라우저가 재생 중인 이전 결과를 덮어쓰지 않게 한다.
     """
@@ -1550,7 +1550,7 @@ def on_video_rerender(
     with processing_slot(on_wait):
         info = render_video(
             video_path, out_path, analysis, effect="blur" if effect == EFFECT_BLUR else "mosaic",
-            unmask=unmask, mask=mask, regions=regions, on_progress=on_progress,
+            edits=edits, on_progress=on_progress,
         )
     return out_path, info
 
@@ -1848,8 +1848,10 @@ def sync_pick_registrations(mode: str, files: list[UploadedFile]) -> None:
     인물 등록 카드를 그리기 전에 불러서, 클릭한 바로 그 화면에서 등록 상태가 같이 바뀌게 한다. 처음부터 등록 인물이라 자동 제외된 얼굴은
     건드리지 않는다. 올린 사람은 origin == "pick" 이고, 다음에 처리할 때부터 자동으로 제외된다. 작은 얼굴이나 옆얼굴처럼 믿을 만한 벡터를
     못 만드는 얼굴은 그 장면에서만 제외되고 등록되지 않는다. (src/exclude.py 의 embed_face)
+    영상은 클릭한 장면 한 장이 아니라 그 사람(track)의 여러 장면에서 여러 각도의 벡터를 모은다. (person_shots → embed_track)
+    영상은 적용 구간이 영상 전체일 때 해제한 사람만 등록한다. 일부 구간만 해제한 사람은 그 구간에서만 드러나고 등록되지 않는다.
     """
-    from src.exclude import embed_face
+    from src.exclude import embed_face, embed_track
 
     people = st.session_state["ref_people"]
     failed: set = st.session_state.setdefault("pick_failed", set())    # 벡터를 못 만든 얼굴은 화면을 다시 그릴 때마다 시도하지 않는다
@@ -1885,28 +1887,49 @@ def sync_pick_registrations(mode: str, files: list[UploadedFile]) -> None:
     elif files:
         edit = current_video_edit(files[0])
         if edit is not None and edit["pargs"] is not None:
+            from src.video import edits_at
+
             view = edit["pargs"]
+            last = len(edit["analysis"].boxes) - 1
+            whole, _ = edits_at(tuple(e for e in edit["edits"] if e[0] == 0 and e[1] == last), 0)    # 영상 전체 구간으로 한 편집만 등록에 반영한다
             for person, detected, auto in zip(view["ids"], view["detected"], view["autos"]):
                 if auto:
                     continue
                 xyxy = tuple(int(v) for v in detected["xyxy"])
-                settle(("pickv", files[0].file_id, person), edit["decision"].get(person) == "unmask",
-                       lambda xyxy=xyxy, frame=view["frame"]: embed_face(read_video_frame_bgr(files[0], frame), xyxy))
+                settle(("pickv", files[0].file_id, person), whole.get(person) == "unmask",
+                       lambda person=person, xyxy=xyxy, frame=view["frame"]: embed_track(person_shots(files[0], edit["analysis"], person, frame, xyxy)))
     if changed:
         sync_ref_embs()
 
 
-def read_video_frame_bgr(uploaded: UploadedFile, frame_idx: int) -> np.ndarray:
-    """업로드한 영상(이 접속의 임시 폴더에 저장된 입력 파일)의 frame_idx 번째 프레임(BGR)."""
+def person_shots(uploaded: UploadedFile, analysis: object, person: int, frame: int, xyxy: tuple) -> list[tuple[np.ndarray, tuple]]:
+    """영상에서 클릭한 사람이 찍힌 장면들 [(프레임 BGR, 얼굴 박스), ...]. 맨 앞은 클릭한 장면이고, 나머지는 그 사람의 다른 장면 중
+    짧은 변이 MIN_VERIFY_SIZE 이상인 것에서 영상 전체에 고르게 PICK_TRACK_FRAMES - 1 장을 고른다. (src/exclude.py 의 embed_track 에 넘긴다)
+    """
+    from src.video import person_of
+
+    spots = [(f, tuple(int(v) for v in box["xyxy"])) for f, boxes in enumerate(analysis.boxes) if f != frame for box in boxes
+             if person_of(analysis, box["track_id"]) == person and min(box["xyxy"][2] - box["xyxy"][0], box["xyxy"][3] - box["xyxy"][1]) >= MIN_VERIFY_SIZE]
+    count = min(len(spots), PICK_TRACK_FRAMES - 1)
+    picked = [spots[i * len(spots) // count] for i in range(count)] if count else []    # 시간 순으로 고르게 (각도가 다양해지게)
+    frames = read_video_frames_bgr(uploaded, [frame] + [f for f, _ in picked])
+    return [(frames[0], xyxy)] + [(img, box) for img, (_, box) in zip(frames[1:], picked) if img is not None]
+
+
+def read_video_frames_bgr(uploaded: UploadedFile, frame_idxs: list[int]) -> list[Optional[np.ndarray]]:
+    """업로드한 영상의 여러 프레임(BGR)을 영상을 한 번만 열어 읽는다. 첫 프레임을 못 읽으면 ValueError, 나머지는 못 읽으면 None."""
     cap = cv2.VideoCapture(str(get_workdir() / f"input{Path(uploaded.name).suffix.lower()}"))
+    frames: list[Optional[np.ndarray]] = []
     try:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ok, frame = cap.read()
+        for frame_idx in frame_idxs:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, img = cap.read()
+            frames.append(img if ok else None)
     finally:
         cap.release()
-    if not ok:
+    if not frame_idxs or frames[0] is None:
         raise ValueError("영상에서 이 장면을 읽을 수 없습니다.")
-    return frame
+    return frames
 
 
 def render_file_tab() -> None:
@@ -2283,38 +2306,54 @@ def new_video_edit(uploaded: UploadedFile, analysis: object, run_id: int) -> dic
     """처음 처리한 영상의 편집 상태를 만든다. 처음 보여 줄 장면은 사람이 가장 많이 잡힌 프레임이다."""
     counts = [sum(1 for box in boxes if box["track_id"] is not None) for boxes in analysis.boxes]
     frame = max(range(len(counts)), key=counts.__getitem__) if counts else 0
-    st.session_state["video_frame"] = frame    # 얼굴 선택 화면에 보여 줄 프레임 번호 (슬라이더는 없앴다)
+    st.session_state["video_frame"] = frame    # 얼굴 선택 화면에 처음 보여 줄 프레임 번호 (장면 슬라이더의 처음 값)
     return {
         "akey": video_edit_key(uploaded), "analysis": analysis, "run": run_id, "version": 0, "render": 0,
-        "decision": {},      # 사람 번호 -> "unmask"(해제) | "mask"(등록 인물이어도 가림). 기본 규칙과 같게 되돌리면 지운다
-        "manual": [],        # 직접 영역 [[x1, y1, x2, y2], ...] (원본 픽셀, 모든 프레임에 같은 자리를 가린다)
-        "applied": ((), ()), "pargs": None,
+        "edits": [],         # 구간별 편집 (start, end, kind, value). 형식은 src/video.py 의 edits_at. 뒤의 편집이 앞을 덮는다
+        "applied": (), "pargs": None,
     }
-
-
-def video_decisions(edit: dict) -> tuple[frozenset, frozenset]:
-    """편집 상태에서 (가리지 않을 사람 번호들, 등록 인물이어도 가릴 사람 번호들)을 꺼낸다."""
-    decision = edit["decision"]
-    return (frozenset(p for p, d in decision.items() if d == "unmask"),
-            frozenset(p for p, d in decision.items() if d == "mask"))
 
 
 def video_edit_snapshot(edit: dict) -> tuple:
     """지금 편집 내용을 비교하기 쉬운 값으로 만든다. 결과 영상에 마지막으로 적용한 것과 같은지 볼 때 쓴다."""
-    return (tuple(sorted(edit["decision"].items())), tuple(tuple(m) for m in edit["manual"]))
+    return tuple(edit["edits"])
+
+
+def video_range_key(edit: dict) -> str:
+    """'적용 구간' 슬라이더의 열쇠. 영상을 새로 처리하면(run) 구간이 영상 전체로 돌아간다."""
+    return f"vrange_{edit['run']}"
+
+
+def video_edit_range(edit: dict) -> tuple[int, int]:
+    """지금 고른 적용 구간 (시작, 끝 프레임, 양끝 포함). 아직 고르지 않았으면 영상 전체."""
+    last = len(edit["analysis"].boxes) - 1
+    start, end = st.session_state.get(video_range_key(edit), (0, last))
+    return max(0, min(int(start), last)), max(0, min(int(end), last))
+
+
+def add_video_edit(edit: dict, start: int, end: int, kind: str, value: object) -> None:
+    """구간 편집 하나를 덧붙인다. 같은 대상(사람 번호 또는 직접 영역)에 대한 앞의 편집 중 이 구간에 완전히 덮이는 것은 지운다(목록이 길어지지 않게)."""
+    person_kind = kind in ("unmask", "mask")
+    edit["edits"] = [
+        e for e in edit["edits"]
+        if not (e[3] == value and (e[2] in ("unmask", "mask")) == person_kind and start <= e[0] and e[1] <= end)
+    ] + [(start, end, kind, value)]
 
 
 def video_picker_view(edit: dict, frame: int) -> dict:
     """프레임 한 장의 얼굴 선택 컴포넌트에 넘길 값을 만든다. 박스 번호는 '사람 번호'(끊긴 track 을 이어 붙인 번호)다.
 
-    같은 열쇠로 다시 그릴 때 값이 바뀌면 컴포넌트가 새로 만들어지므로(사진과 같은 이유), 처음 계산한 값을 그대로 돌려준다.
-    처음에 '제외'로 보일 사람: 등록 인물로 빠진 사람 + 해제한 사람 - 다시 가리기로 한 사람.
+    같은 열쇠로 다시 그릴 때 값이 바뀌면 컴포넌트가 새로 만들어지므로(사진과 같은 이유), 같은 장면이면 처음 계산한 값을 그대로 돌려준다.
+    다른 장면으로 옮기면 version 을 올려 새 열쇠를 쓴다. 전에 본 장면으로 돌아왔을 때 그 장면의 옛 선택값이 지금 편집을 되돌리지 않게 하려는 것이다.
+    '제외'로 보일 사람: 이 프레임의 편집이 해제한 사람 + (편집이 없으면) 등록 인물로 빠진 사람. 직접 영역은 이 프레임에 걸린 것만 보인다.
     """
-    from src.video import person_of
+    from src.video import edits_at, person_of
 
+    if edit["pargs"] is not None:
+        if edit["pargs"]["frame"] == frame:
+            return edit["pargs"]
+        edit["version"] += 1
     key = f"vpicker_{edit['run']}_{edit['version']}_{frame}"
-    if edit["pargs"] is not None and edit["pargs"]["key"] == key:
-        return edit["pargs"]
     analysis, auto = edit["analysis"], edit["analysis"].auto_excluded[frame]
     ids: list[int] = []
     detected: list[dict] = []
@@ -2325,38 +2364,53 @@ def video_picker_view(edit: dict, frame: int) -> dict:
         ids.append(person)
         detected.append({"xyxy": box["xyxy"], "conf": box["conf"], "auto_excluded": i in auto})
     autos = [d["auto_excluded"] for d in detected]
-    decision = edit["decision"]
+    decision, regions = edits_at(tuple(edit["edits"]), frame)
     view = {
         "key": key, "frame": frame, "ids": ids, "detected": detected, "autos": autos,
         "excluded": [p for p, a in zip(ids, autos) if decision.get(p) == "unmask" or (p not in decision and a)],
         "reset": [p for p, a in zip(ids, autos) if a],
-        "manual": [list(m) for m in edit["manual"]],
+        "manual": [list(m) for m in regions],
     }
     edit["pargs"] = view
     return view
 
 
-def sync_video_edits(uploaded: UploadedFile) -> None:
-    """얼굴 선택 컴포넌트의 현재 값을 편집 상태(사람별 해제·가림, 직접 영역)에 옮긴다. 결과 영상은 적용 버튼을 눌러야 바뀐다.
+def same_region(a: tuple, b: tuple, tol: int = 3) -> bool:
+    """두 직접 영역이 같은 것인지. 화면(캔버스) 좌표와 원본 픽셀을 오가며 생기는 몇 픽셀 반올림 차이는 같은 것으로 본다."""
+    return all(abs(int(p) - int(q)) <= tol for p, q in zip(a, b))
 
-    사람마다 '그 장면에서 기본으로 보이는 상태(등록 인물이면 제외)'와 같아지면 결정을 지우고, 다르면 해제(unmask)/가림(mask)으로 기록한다.
-    사람 단위라서 한 장면에서 한 번 고르면 영상 전체에 적용된다. 직접 영역은 모든 프레임의 같은 자리에 적용된다.
+
+def sync_video_edits(uploaded: UploadedFile) -> None:
+    """얼굴 선택 컴포넌트의 현재 값을 구간 편집으로 옮긴다. 결과 영상은 적용 버튼을 눌러야 바뀐다.
+
+    보고 있는 장면에서 지금 보이는 상태(edits_at)와 컴포넌트의 값이 다른 것만, 지금 고른 적용 구간에 대한 편집으로 덧붙인다.
+    - 사람: 제외로 바꾸면 "unmask", 가림으로 바꾸면 "mask" (등록 인물이 아니어도 구간 안의 앞선 해제를 덮는다)
+    - 직접 영역: 새로 그린 것은 "region", 지운 것은 "unregion" (다른 구간에 그 영역이 있으면 그곳은 그대로)
+    보고 있는 장면이 적용 구간 밖이면 아무것도 하지 않는다(화면이 장면을 구간 안으로 옮긴다).
     """
+    from src.video import edits_at
+
     edit = current_video_edit(uploaded)
     if edit is None or edit["pargs"] is None:
         return
     view, analysis = edit["pargs"], edit["analysis"]
     parsed = parse_edit(st.session_state.get(view["key"]), None, set(view["ids"]), (analysis.width, analysis.height))
-    if parsed is None:    # 아직 만지지 않았다
+    start, end = video_edit_range(edit)
+    if parsed is None or not start <= view["frame"] <= end:    # 아직 만지지 않았거나, 장면이 구간 밖
         return
+    decision, regions = edits_at(tuple(edit["edits"]), view["frame"])
     chosen = set(parsed["excluded"])
     for person, auto in zip(view["ids"], view["autos"]):
-        want = person in chosen
-        if want == auto:
-            edit["decision"].pop(person, None)
-        else:
-            edit["decision"][person] = "unmask" if want else "mask"
-    edit["manual"] = parsed["manual"]
+        want, now = person in chosen, decision.get(person, "unmask" if auto else "mask") == "unmask"
+        if want != now:
+            add_video_edit(edit, start, end, "unmask" if want else "mask", person)
+    drawn = [tuple(m) for m in parsed["manual"]]
+    for region in regions:
+        if not any(same_region(region, d) for d in drawn):
+            add_video_edit(edit, start, end, "unregion", region)
+    for d in drawn:
+        if not any(same_region(region, d) for region in regions):
+            add_video_edit(edit, start, end, "region", d)
 
 
 @st.cache_data(show_spinner=False, max_entries=48)
@@ -2402,9 +2456,8 @@ def run_video(uploaded: UploadedFile, ui: JobUI) -> None:
     try:
         if edit is not None:
             edit["render"] += 1
-            unmask, mask = video_decisions(edit)
             out_path, info = on_video_rerender(
-                in_path, edit["analysis"], effect, unmask, mask, tuple(tuple(m) for m in edit["manual"]), edit["render"],
+                in_path, edit["analysis"], effect, tuple(edit["edits"]), edit["render"],
                 on_progress=on_progress, on_wait=ui.waiting,
             )
             edit["applied"] = video_edit_snapshot(edit)
@@ -2427,6 +2480,30 @@ def run_video(uploaded: UploadedFile, ui: JobUI) -> None:
     ui.finish("처리 완료")
 
 
+def render_video_sliders(edit: dict) -> int:
+    """'적용 구간'(고친 내용이 들어갈 시작~끝)과 '보는 장면' 슬라이더를 그리고, 보여 줄 프레임 번호를 돌려준다.
+
+    보는 장면은 적용 구간 안에서만 고를 수 있다. 구간을 좁혀 장면이 밖으로 나가면 구간 안 가장 가까운 프레임으로 옮긴다.
+    (구간 밖 장면에서 고친 내용은 그 장면에 보이지 않아 화면과 편집이 어긋나기 때문이다)
+    """
+    analysis = edit["analysis"]
+    last = len(analysis.boxes) - 1
+    fps = analysis.fps if analysis.fps > 0 else 30.0
+
+    def stamp(f: int) -> str:
+        return f"{int(f / fps // 60)}:{f / fps % 60:05.2f}"
+
+    frames = list(range(last + 1))
+    start, end = st.select_slider("적용 구간", options=frames, value=(0, last), format_func=stamp, key=video_range_key(edit))
+    frame_key = f"vframe_{edit['run']}"
+    now = int(st.session_state.get(frame_key, st.session_state.get("video_frame", 0)))
+    st.session_state[frame_key] = min(max(now, start), end)    # 슬라이더를 그리기 전이라 바꿔도 된다
+    if start == end:
+        st.caption(f"보는 장면 {stamp(start)} (구간이 한 프레임이에요)")
+        return start
+    return int(st.select_slider("보는 장면", options=frames[start:end + 1], format_func=stamp, key=frame_key))
+
+
 def render_video_rows(uploaded: UploadedFile, ui: JobUI, effect: str, apply_key: str) -> None:
     """업로드한 영상을 재생해 보여 주고 처리 결과를 보여 준다. 처리한 뒤에는 사진처럼 왼쪽이 얼굴을 고르는 화면이 된다."""
     # 원본(왼쪽)과 결과(오른쪽)를 나란히 놓는다. 결과 칸은 처리가 끝난 뒤에 채워진다.
@@ -2438,15 +2515,7 @@ def render_video_rows(uploaded: UploadedFile, ui: JobUI, effect: str, apply_key:
         if edit is None:
             st.video(uploaded)    # 재생 버튼이 달린 플레이어
         else:
-            analysis = edit["analysis"]
-            frame = min(max(int(st.session_state.get("video_frame", 0)), 0), len(analysis.boxes) - 1)
-            view = video_picker_view(edit, frame)
-            input_path = str(get_workdir() / f"input{Path(uploaded.name).suffix.lower()}")
-            face_picker_boxes(
-                key=view["key"], src=video_frame_url(uploaded.file_id, input_path, frame), image_shape=(analysis.height, analysis.width),
-                detected=view["detected"], excluded=view["excluded"], manual=view["manual"],
-                reset_excluded=view["reset"], token=view["key"], ids=view["ids"],
-            )
+            picker_slot = st.container()    # 얼굴 선택 화면은 슬라이더(아래)로 장면을 정한 뒤에 채운다
     with col_result:
         if has_result:
             st.video(res["path"])
@@ -2459,9 +2528,19 @@ def render_video_rows(uploaded: UploadedFile, ui: JobUI, effect: str, apply_key:
                 st.caption(f"{res.get('effect', EFFECT_MOSAIC)} 결과")
 
     if edit is not None:
+        frame = render_video_sliders(edit)
+        analysis = edit["analysis"]
+        view = video_picker_view(edit, frame)
+        input_path = str(get_workdir() / f"input{Path(uploaded.name).suffix.lower()}")
+        with picker_slot:
+            face_picker_boxes(
+                key=view["key"], src=video_frame_url(uploaded.file_id, input_path, frame), image_shape=(analysis.height, analysis.width),
+                detected=view["detected"], excluded=view["excluded"], manual=view["manual"],
+                reset_excluded=view["reset"], token=view["key"], ids=view["ids"],
+            )
         st.caption(
-            f"얼굴을 클릭하면 {effect}가 해제되고 다시 클릭하면 가려져요. 한 번 고르면 영상 전체에 적용돼요. "
-            "빈 곳을 끌면 영상 전체에서 같은 자리를 가리는 직접 영역이 생겨요."
+            f"얼굴을 클릭하면 {effect}가 해제되고 다시 클릭하면 가려져요. 빈 곳을 끌면 그 자리를 가리는 직접 영역이 생기고, 지우면 빠져요. "
+            "고친 내용은 '적용 구간'에만 들어가요(처음엔 영상 전체)."
         )
         if video_edit_snapshot(edit) != edit["applied"]:
             st.info(f"고친 내용이 있어요. 아래 '{effect} 적용' 버튼을 누르면 결과 영상에 반영돼요.")
