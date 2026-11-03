@@ -38,6 +38,7 @@ import tempfile
 import threading
 import time
 import zipfile
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -62,7 +63,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.config import LIVE_VIEW_REFRESH, MAX_VIDEO_SECONDS, MAX_VIDEO_SHORT_SIDE, PAD, SIM_THRESHOLD, STREAM_IDLE_STOP    # 영상 제한(1분·720p)과 블러 여백은 공통 설정 파일에서 읽는다
+from src.config import LIVE_VIEW_REFRESH, MAX_VIDEO_SECONDS, MAX_VIDEO_SHORT_SIDE, PAD, SIM_THRESHOLD, STREAM_CAPTURE_INTERVAL, STREAM_IDLE_STOP, STREAM_RECENT_FRAMES    # 영상 제한(1분·720p)과 블러 여백은 공통 설정 파일에서 읽는다
 
 # ============================================================
 # 1. 기본 설정
@@ -374,10 +375,6 @@ footer { visibility: hidden; }
 [class*="st-key-pick_on_"] .stButton > button * { color: var(--select-ink) !important; font-weight: 700; }
 [class*="st-key-pick_on_"] .stButton > button:hover { background: var(--select); border: 1px solid transparent; filter: brightness(.96); }
 [class*="st-key-pick_off_"] .stButton, [class*="st-key-pick_on_"] .stButton { margin-top: .2rem; }
-/* 실시간 처리 중에는 등록 태그가 막힌다: 막힌 버튼의 공통 모양(검정)이 태그 색을 덮지 않게 태그 색을 그대로 두고 흐리게만 한다 */
-[class*="st-key-pick_off_"] .stButton > button:disabled { background: var(--mint-soft) !important; border: 1px solid var(--mint-line) !important; }
-[class*="st-key-pick_on_"] .stButton > button:disabled { background: var(--select) !important; }
-
 /* 인물 등록 카드: 등록된 인물 줄(작은 사진 + 태그 + 해제 버튼)과 맨 아래의 '등록 인물 제외' 스위치 */
 /* 등록된 사람들 줄: 태그 · 작은 사진들 · 등록 해제 버튼이 한 줄에 가지런히 놓이고, 좁아지면 줄만 바뀐다 */
 [class*="st-key-reg_row"] {
@@ -1203,10 +1200,20 @@ def start_candidate_job(sources: list[UploadedFile], source_id: str) -> None:
 
 
 def start_stream_candidate_job(url: str, source_id: str) -> None:
-    """실시간 주소에서 장면을 자동 캡처해 얼굴 후보를 찾는 일을 백그라운드에서 시작한다. (start_candidate_job 과 같은 방식)"""
+    """실시간 주소에서 얼굴 후보를 찾는 일을 백그라운드에서 시작한다. (start_candidate_job 과 같은 방식)
+
+    실시간 처리가 도는 중이면 새로 캡처하지 않고, 처리하며 모아 둔 최근 장면(약 STREAM_RECENT_FRAMES 초)과 지금 화면에서 찾는다.
+    그래서 등록할 사람이 이미 지나갔어도 고를 수 있다. 처리 전이면 스트림에서 앞으로 몇 초를 캡처한다.
+    """
     if candidate_job_pending():
         return
-    job = get_job_executor().submit(find_stream_candidates, url, str(get_workdir() / "stream_sample"))
+    live = st.session_state.get("live")
+    frames = live.recent_frames() if live is not None else []
+    if frames:
+        paths = save_live_frames(frames, get_workdir() / "live_recent")
+        job = get_job_executor().submit(find_candidates, paths)
+    else:
+        job = get_job_executor().submit(find_stream_candidates, url, str(get_workdir() / "stream_sample"))
     st.session_state["cand_job"] = {"future": job, "source_id": source_id}
     st.session_state["candidates"] = None
     st.session_state["cand_error"] = None
@@ -1550,7 +1557,7 @@ def on_video_rerender(
 
 def on_stream(
     url: str,
-    ref_embs: Optional[np.ndarray],
+    ref_embs: object,
     effect: object = EFFECT_MOSAIC,
     queue: Optional["TicketQueue"] = None,
     should_stop: Optional[Callable[[], bool]] = None,
@@ -1559,6 +1566,7 @@ def on_stream(
 
     정보 dict: {"faces_now": 현재 인원, "faces_total": 누적 인원, "fps": 처리 속도, "original_rgb": 가리기 전 원본 RGB 프레임}
     effect 는 가리는 방식("모자이크"/"블러")이거나 그것을 돌려주는 함수다. 함수면 프레임마다 다시 물어서, 도는 중에도 방식을 바꿀 수 있다.
+    ref_embs 도 등록 인물 벡터(없으면 None)이거나 그것을 돌려주는 함수다. 함수면 도는 중에 등록·해제한 것이 다음 프레임부터 반영된다.
     끝이 없는 처리라 대기열에서 기다리지 않고, 자리가 없으면 바로 BusyError 를 낸다. 스레드에서 부를 때는 queue 를 넘긴다.
     """
     # ┌────────────────────────────────────────────┐
@@ -1582,6 +1590,19 @@ def find_stream_candidates(url: str, folder: str) -> list[dict]:
     from src.stream import sample_stream_frames
 
     return find_candidates(sample_stream_frames(url, folder))
+
+
+def save_live_frames(frames: list[bytes], folder: Path) -> list[str]:
+    """실시간 처리 중 모아 둔 JPEG 장면들을 folder 에 저장하고 경로를 돌려준다. 이전에 저장한 장면은 먼저 지운다."""
+    folder.mkdir(parents=True, exist_ok=True)
+    for old in folder.glob("live_*.jpg"):
+        old.unlink()
+    paths = []
+    for i, data in enumerate(frames):
+        path = folder / f"live_{i:02d}.jpg"
+        path.write_bytes(data)
+        paths.append(str(path))
+    return paths
 
 
 # ============================================================
@@ -2499,11 +2520,13 @@ class LiveJob:
 
     def __init__(self, url: str, ref_embs: Optional[np.ndarray], effect: str) -> None:
         self.url = url
-        self.ref_embs = ref_embs            # 시작할 때의 등록 인물 (도는 중에는 바꿀 수 없다)
+        self.ref_embs = ref_embs            # 지금의 등록 인물 (화면이 등록·해제할 때 바꾸면 다음 프레임부터 반영된다)
         self.effect = effect                # 지금의 가리는 방식 (화면이 바꾼다)
         self.lock = threading.Lock()
         self.pair: Optional[tuple] = None   # 가장 최근 (원본 RGB, 결과 RGB)
         self.info: dict = {}
+        self.recent: deque = deque(maxlen=STREAM_RECENT_FRAMES)    # STREAM_CAPTURE_INTERVAL 초마다 보관한 원본 장면 (JPEG 바이트)
+        self.recent_at = 0.0                # 마지막으로 장면을 보관한 시각
         self.error: Optional[tuple] = None  # ("module" | "text", 내용)
         self.done = False
         self.stop = threading.Event()
@@ -2514,16 +2537,40 @@ class LiveJob:
         """멈추라고 했거나, 화면이 STREAM_IDLE_STOP 초 넘게 소식이 없으면(탭을 닫음) True."""
         return self.stop.is_set() or time.monotonic() - self.last_seen > STREAM_IDLE_STOP
 
+    def keep_recent(self, original_rgb: np.ndarray) -> None:
+        """STREAM_CAPTURE_INTERVAL 초가 지났으면 원본 장면을 JPEG 로 보관한다. (처리 중에 제외할 얼굴을 찾을 때 쓴다)"""
+        now = time.monotonic()
+        if now - self.recent_at < STREAM_CAPTURE_INTERVAL:
+            return
+        ok, buf = cv2.imencode(".jpg", cv2.cvtColor(original_rgb, cv2.COLOR_RGB2BGR))
+        if ok:
+            with self.lock:
+                self.recent.append(buf.tobytes())
+            self.recent_at = now
+
+    def recent_frames(self) -> list[bytes]:
+        """보관한 최근 장면들과 지금 화면(원본)을 JPEG 바이트 목록으로 돌려준다. 아직 받은 프레임이 없으면 []."""
+        with self.lock:
+            frames = list(self.recent)
+            pair = self.pair
+        if pair is not None:
+            ok, buf = cv2.imencode(".jpg", cv2.cvtColor(pair[0], cv2.COLOR_RGB2BGR))
+            if ok:
+                frames.append(buf.tobytes())
+        return frames
+
 
 def run_live_job(job: LiveJob, queue: object) -> None:
     """LiveJob 의 스레드 본체. 프레임이 올 때마다 job 에 최신 (원본, 결과)를 남기고, 끝나면 오류(있다면)와 함께 done 을 켠다."""
     try:
-        frames = on_stream(job.url, job.ref_embs, lambda: job.effect, queue=queue, should_stop=job.should_stop)
+        frames = on_stream(job.url, lambda: job.ref_embs, lambda: job.effect, queue=queue, should_stop=job.should_stop)
         try:
             for result_rgb, info in frames:
                 original_rgb = info.pop("original_rgb")
                 with job.lock:
                     job.pair, job.info = (original_rgb, result_rgb), info
+                if original_rgb is not None:
+                    job.keep_recent(original_rgb)
         finally:
             frames.close()    # 자리를 반드시 돌려준다
     except ImportError as err:
@@ -2540,7 +2587,7 @@ def run_live_job(job: LiveJob, queue: object) -> None:
 
 
 def start_live(url: str, effect: str) -> None:
-    """실시간 처리를 스레드로 시작한다. (등록 인물은 지금 값으로 고정된다)"""
+    """실시간 처리를 스레드로 시작한다. (도는 중에 등록·해제하면 sync_ref_embs 가 job.ref_embs 를 바꿔 바로 반영된다)"""
     job = LiveJob(url, st.session_state["ref_embs"], effect)
     job.thread = threading.Thread(target=run_live_job, args=(job, get_queue()), name="live-stream", daemon=True)
     job.thread.start()
@@ -2660,6 +2707,9 @@ def sync_ref_embs() -> None:
     """
     people = st.session_state["ref_people"]
     st.session_state["ref_embs"] = np.vstack([p["embs"] for p in people.values()]) if people else None
+    live = st.session_state.get("live")
+    if live is not None:    # 실시간 처리가 도는 중이면 다음 프레임부터 새 등록으로 가린다
+        live.ref_embs = st.session_state["ref_embs"]
 
 
 def unit_rows(embs: np.ndarray) -> np.ndarray:
@@ -2794,15 +2844,16 @@ def render_person_card(mode: str, files: list[UploadedFile]) -> None:
 def render_stream_person_card(url: str) -> None:
     """실시간 주소의 '인물 등록' 카드. 사진·영상 탭의 카드와 같은 모양·같은 동작이고, 후보를 올린 파일 대신 스트림에서 찾는 것만 다르다.
 
-    [모자이크 제외할 얼굴 선택]을 누르면 그 스트림에서 STREAM_CAPTURE_FRAMES 장을 STREAM_CAPTURE_INTERVAL 초 간격으로 자동 캡처해
-    얼굴 후보를 만든다. 실시간 처리가 도는 동안에는 등록을 바꿀 수 없어서 버튼이 막힌다(바꾸려면 [정지]).
+    [모자이크 제외할 얼굴 선택]을 누르면, 처리 전에는 그 스트림에서 STREAM_CAPTURE_FRAMES 장을 STREAM_CAPTURE_INTERVAL 초 간격으로
+    자동 캡처하고, 실시간 처리 중에는 처리하며 모아 둔 최근 장면과 지금 화면에서 얼굴 후보를 만든다. 처리 중에 등록·해제해도 멈추지 않고 바로 반영된다.
     """
     running = st.session_state.get("live") is not None
     with st.container(key="card_person"):
         with st.container(key="person_head"):    # 제목은 왼쪽, 버튼은 오른쪽 끝
             st.markdown('<div class="card-title">인물 등록</div>', unsafe_allow_html=True)
-            find_clicked = st.button("모자이크 제외할 얼굴 선택", key="find_candidates", disabled=candidate_job_pending() or running)
-        st.caption("실시간 처리 중에는 등록을 바꿀 수 없습니다. 변경하려면 멈추세요.")
+            find_clicked = st.button("모자이크 제외할 얼굴 선택", key="find_candidates", disabled=candidate_job_pending())
+        if running:
+            st.caption(f"처리 중에는 최근 약 {round(STREAM_RECENT_FRAMES * STREAM_CAPTURE_INTERVAL)}초 장면과 지금 화면에서 얼굴을 찾고, 등록·해제하면 바로 반영됩니다.")
         source_id = f"stream|{url}"
         if st.session_state["candidates_for"] != source_id:    # 다른 주소로 바뀌면 이전 후보는 지운다
             st.session_state["candidates"] = None
@@ -2810,15 +2861,16 @@ def render_stream_person_card(url: str) -> None:
             start_stream_candidate_job(url, source_id)
             st.rerun()
         settle_candidate_job(source_id)
-        render_candidates(source_id, locked=running)
+        render_candidates(source_id)
         render_candidate_loading()
-        render_registered_people(locked=running)
+        render_registered_people()
 
 
-def render_registered_people(locked: bool = False) -> None:
-    """등록된 사람들을 카드 맨 아래 한 줄(태그 · 작은 사진들 · 등록 해제)로 보여 준다. 모두 해제하는 버튼도 여기 하나뿐이다. locked 면 해제 버튼을 막는다."""
+def render_registered_people() -> None:
+    """등록된 사람들을 카드 맨 아래 한 줄(태그 · 작은 사진들 · 등록 해제)로 보여 준다. 모두 해제하는 버튼도 여기 하나뿐이다."""
     people = st.session_state["ref_people"]
     if not people:
+        st.empty()    # 빈 자리로 덮어쓴다: 실시간 처리 중(조각이 계속 다시 그려지는 동안)에는 그리지 않은 줄이 화면에서 지워지지 않고 남는다
         return
     with st.container(key="reg_row"):
         st.markdown(f'<span class="reg-tag on">✓ 등록됨({len(people)}명)</span>', unsafe_allow_html=True)
@@ -2826,11 +2878,11 @@ def render_registered_people(locked: bool = False) -> None:
             for person in people.values():
                 st.image(square_thumb(person["thumb"], REGISTERED_THUMB_WIDTH * 2), width=REGISTERED_THUMB_WIDTH)
         with st.container(key="clear_row"):
-            st.button("등록 해제", key="clear_ref", on_click=clear_registration, disabled=locked)
+            st.button("등록 해제", key="clear_ref", on_click=clear_registration)
 
 
-def render_candidates(source_id: str, locked: bool = False) -> None:
-    """찾은 얼굴 후보를 작은 사진으로 격자에 늘어놓고, 사진마다 '등록' 태그 버튼을 둔다. 등록된 후보는 '✓ 등록됨'(켜짐)으로 색이 확 바뀐다. locked 면 버튼을 막는다."""
+def render_candidates(source_id: str) -> None:
+    """찾은 얼굴 후보를 작은 사진으로 격자에 늘어놓고, 사진마다 '등록' 태그 버튼을 둔다. 등록된 후보는 '✓ 등록됨'(켜짐)으로 색이 확 바뀐다."""
     candidates = st.session_state["candidates"]
     if candidates is None:
         return                                  # 아직 찾기 전
@@ -2847,7 +2899,7 @@ def render_candidates(source_id: str, locked: bool = False) -> None:
                 st.image(square_thumb(cv2.cvtColor(cand["thumb"], cv2.COLOR_BGR2RGB), CANDIDATE_THUMB_WIDTH * 2), width=CANDIDATE_THUMB_WIDTH)
                 st.caption(f"후보 {i + 1} · {cand['frames']}회")
                 with st.container(key=f"pick_{'on' if registered else 'off'}_{i}"):    # 켜짐/꺼짐에 따라 CSS 가 다른 색을 입힌다
-                    st.button("✓ 등록됨" if registered else "등록", key=f"pick_{i}", disabled=locked,
+                    st.button("✓ 등록됨" if registered else "등록", key=f"pick_{i}",
                               on_click=toggle_candidate, args=(cand_key, cand["embs"], cand["thumb"]))
 
 
