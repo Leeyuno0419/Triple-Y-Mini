@@ -31,6 +31,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -105,6 +106,11 @@ DISPLAY_SIZE = (1280, 720)
 # 사진 여러 장을 한 번에 올릴 수 있는 최대 개수 (화면을 다시 그릴 때마다 모두 읽기 때문에 상한을 둔다)
 # TODO: 위와 같이 팀에 알린 뒤 config.py 로 옮긴다.
 MAX_IMAGE_FILES = 20
+
+# 영상을 여러 개 올려 둘 수 있는 최대 개수, 실시간 주소·파일을 등록해 둘 수 있는 최대 개수. 둘 다 처리는 고른 하나만 한다 (여러 개를 동시에 돌리면 과부하)
+# TODO: 위와 같이 팀에 알린 뒤 config.py 로 옮긴다.
+MAX_VIDEO_FILES = 5
+MAX_STREAM_SOURCES = 8
 
 # 가리는 방식 (사진·영상 모두. 블러 세기는 src/config.py 의 BLUR_SIGMA_RATIO · BLUR_EDGE_RATIO)
 EFFECT_MOSAIC = "모자이크"
@@ -251,7 +257,9 @@ footer { visibility: hidden; }
 /* 장식 원과 스크롤 힌트는 화면 전체(screen_register)를 기준으로 놓는다. Streamlit 이 감싸는 상자(position: relative)가 기준이 되지 않게 푼다 */
 [class*="st-key-screen_register"] [data-testid="stElementContainer"]:has(.blob) { position: static; }
 [class*="st-key-screen_register"] .landing-title { font-size: clamp(1.9rem, 4.6vw, 2.8rem); margin: 1rem 0; }
-[class*="st-key-screen_register"] .scroll-hint { position: static; margin-top: .6rem; animation: bounce 1.8s ease-in-out infinite; animation-timeline: auto; animation-range: normal; }
+/* '스크롤하세요' 안내는 메인 첫 화면(.landing)과 똑같이 화면 아래쪽(바닥에서 6.5rem)에 놓는다. 안내를 감싼 상자가 기준이 되지 않게 푼다 */
+[class*="st-key-screen_register"] [data-testid="stElementContainer"]:has(.scroll-hint) { position: static; }
+[class*="st-key-screen_register"] .scroll-hint { position: absolute; bottom: 6.5rem; left: 0; right: 0; animation: bounce 1.8s ease-in-out infinite; animation-timeline: auto; animation-range: normal; }
 @media (prefers-reduced-motion: reduce) { [class*="st-key-screen_register"] .blob, [class*="st-key-screen_register"] .scroll-hint { animation: none; } }
 .landing-title {
     position: relative; margin: 1.3rem 0 1.2rem; color: var(--ink);
@@ -513,7 +521,7 @@ footer { visibility: hidden; }
     box-shadow: 0 -8px 30px rgba(60, 110, 160, 0.14);
 }
 [class*="st-key-bottom_bar"]::before {   /* 가운데 칸: 로고 이미지 (app/static/yyy_logo.png) */
-    content: ""; grid-column: 2; grid-row: 1; width: 4.6rem; height: 2.1rem;
+    content: ""; grid-column: 2; grid-row: 1; width: 3.9rem; height: 1.8rem; cursor: pointer;   /* 누르면 소개 창이 열린다 (MODAL_JS) */
     background: url("/app/static/yyy_logo.png") no-repeat center / contain;
 }
 /* 라디오를 감싼 상자들을 풀어서(contents) 두 메뉴 버튼이 바의 칸에 바로 놓이게 한다 */
@@ -548,8 +556,127 @@ html:is([data-tone="register"], [data-tone="work"]) [class*="st-key-bottom_bar"]
 html:is([data-tone="register"], [data-tone="work"]) [class*="st-key-bottom_bar"] label[data-baseweb="radio"]:nth-of-type(2) { color: var(--select-ink); font-weight: 700; }
 @media (max-width: 520px) {   /* 좁은 화면(휴대폰)에서는 칸과 간격을 줄인다 */
     [class*="st-key-bottom_bar"] { --nav-w: 8rem; column-gap: .5rem; }
-    [class*="st-key-bottom_bar"]::before { width: 3.2rem; height: 1.6rem; }
+    [class*="st-key-bottom_bar"]::before { width: 2.8rem; height: 1.4rem; }
     [class*="st-key-bottom_bar"] label[data-baseweb="radio"] { padding: .5rem .9rem; font-size: .85rem; }
+}
+
+/* ---- 버튼 안의 글씨는 어떤 버튼이든 가로·세로 정가운데에 놓는다 ---- */
+.stButton > button,
+[data-testid="stDownloadButton"] button,
+[data-testid="stFormSubmitButton"] button,
+[data-testid="stFileUploaderDropzone"] button {
+    display: inline-flex; align-items: center; justify-content: center; text-align: center; line-height: 1.2;
+}
+.stButton > button > div,
+[data-testid="stDownloadButton"] button > div,
+[data-testid="stFormSubmitButton"] button > div,
+[data-testid="stFileUploaderDropzone"] button > div { display: flex; align-items: center; justify-content: center; width: 100%; margin: 0; }
+.stButton > button p,
+[data-testid="stDownloadButton"] button p,
+[data-testid="stFormSubmitButton"] button p { margin: 0 !important; text-align: center; line-height: 1.2; }
+[class*="st-key-mode_picker"] label[data-baseweb="radio"] { display: flex; align-items: center; justify-content: center; }   /* 사진/영상 · 모자이크/블러 전환 알약 */
+[class*="st-key-bottom_bar"] label[data-baseweb="radio"] { align-items: center; }                                              /* 하단 메뉴 알약 */
+
+/* '스크롤하세요' 안내: 누르면 다음 화면으로 내려간다 (PAGING_JS) */
+.scroll-hint { cursor: pointer; }
+.scroll-hint span { padding: .5rem 1.6rem; }
+
+/* ---- TRIPLE Y 소개 창 (로고를 누르면 MODAL_JS 가 연다) ---- */
+.stApp::before { cursor: pointer; }   /* 상단 바의 제목도 로고처럼 누르면 소개 창이 열린다 */
+.ty-modal {
+    position: fixed; inset: 0; z-index: 2000; display: none; align-items: center; justify-content: center; padding: 1rem; box-sizing: border-box;
+    background: rgba(17, 20, 24, 0.58); backdrop-filter: blur(2px);   /* 뒤 화면을 어둡게 (dim) */
+}
+.ty-modal.open { display: flex; animation: ty-fade .18s ease-out; }
+.ty-modal-box {
+    position: relative; width: min(660px, 100%); max-height: min(88vh, 760px); overflow-y: auto; box-sizing: border-box;
+    background: var(--card); color: var(--ink); border-radius: 24px; padding: 2.1rem 2.3rem 1.9rem;
+    box-shadow: 0 26px 70px rgba(17, 20, 24, 0.3); animation: ty-pop .22s ease-out;
+    font-family: inherit; text-align: left; word-break: keep-all;
+}
+.ty-modal-close {
+    position: absolute; top: .9rem; right: .9rem; width: 2.2rem; height: 2.2rem; padding: 0; border: none; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center; cursor: pointer;
+    background: var(--sky-soft); color: var(--ink); font-size: 1.15rem; line-height: 1; transition: background .15s;
+}
+.ty-modal-close:hover { background: var(--sky); }
+.ty-modal-head { display: flex; align-items: center; gap: .9rem; margin-bottom: .3rem; padding-right: 2.4rem; }
+.ty-modal-head img { height: 2.3rem; width: auto; }
+.ty-modal-title { font-size: 1.45rem; font-weight: 800; letter-spacing: -.01em; margin: 0; }
+.ty-modal-lead { color: var(--muted); font-size: .95rem; line-height: 1.7; margin: .5rem 0 1.4rem; }
+.ty-modal h3 { font-size: .78rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin: 1.5rem 0 .7rem; }
+.ty-modal p { margin: 0; line-height: 1.7; font-size: .95rem; }
+.ty-team { display: grid; grid-template-columns: repeat(3, 1fr); gap: .7rem; }
+.ty-member { background: var(--sky-soft); border-radius: 14px; padding: .9rem 1rem; }
+.ty-member b { display: block; font-size: 1rem; }
+.ty-member span { display: block; color: var(--muted); font-size: .82rem; line-height: 1.55; margin-top: .25rem; }
+.ty-member em { font-style: normal; font-size: .72rem; font-weight: 700; color: var(--select-ink); background: var(--mint); border-radius: 999px; padding: .05rem .5rem; margin-right: .35rem; }
+.ty-stack { display: flex; flex-wrap: wrap; gap: .45rem; }
+.ty-chip { background: #fff; border: 1px solid var(--line); border-radius: 999px; padding: .25rem .8rem; font-size: .82rem; font-weight: 600; }
+.ty-chip.main { background: var(--select); border-color: transparent; color: var(--select-ink); }
+@keyframes ty-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes ty-pop { from { opacity: 0; transform: translateY(10px) scale(.98); } to { opacity: 1; transform: none; } }
+@media (max-width: 560px) { .ty-modal-box { padding: 1.6rem 1.3rem 1.4rem; } .ty-team { grid-template-columns: 1fr; } }
+
+/* ---- 원본 사진 삭제 아이콘: 사진 한 장씩 지운다. 버튼 모양 없이 빨간 휴지통만, 원본 사진의 오른쪽 위에 겹쳐 놓는다 ---- */
+/* (help 를 단 버튼은 Streamlit 이 툴팁 상자로 한 겹 더 감싸서, 버튼 선택자는 '> button' 이 아니라 'button' 으로 쓴다) */
+[data-testid="stColumn"]:has([class*="st-key-del_img_"]) { position: relative; }   /* 원본 사진 칸이 겹치는 기준 */
+[class*="st-key-del_img_"] {   /* 원본 사진 칸 전체(16:9)를 덮는 투명한 층. 클릭은 아래 사진(얼굴 선택)으로 그대로 통과한다 */
+    position: absolute !important; top: 0 !important; left: 0 !important; right: auto !important; bottom: auto !important;
+    width: 100% !important; margin: 0 !important; padding: 0 !important; aspect-ratio: 16 / 9; display: block !important; z-index: 5; pointer-events: none;
+}
+[class*="st-key-del_img_"] [data-testid="stElementContainer"]:has(style) { display: none; }   /* 위치값(--del-top, --del-right)만 담은 요소 */
+[class*="st-key-del_img_"] [data-testid="stElementContainer"]:has(button) {   /* 아이콘은 실제 사진의 오른쪽 위 구석 안쪽에 둔다 */
+    position: absolute; top: calc(var(--del-top, 0%) + .35rem); right: calc(var(--del-right, 0%) + .35rem); left: auto !important;
+    width: 2rem !important; min-width: 0 !important; max-width: 2rem !important; pointer-events: auto;   /* 폭을 아이콘 크기로 못 박는다 (Streamlit 이 칸 전체 폭을 잡으면 오른쪽 기준 배치가 왼쪽으로 밀린다) */
+}
+[class*="st-key-del_img_"] button {
+    width: 2rem; height: 2rem; min-height: 0; padding: 0; border-radius: 6px;
+    background: transparent !important; border: none !important; box-shadow: none !important;   /* 버튼 모양 제거 */
+}
+[class*="st-key-del_img_"] button * { color: #E5252A !important; font-size: 1.4rem; }   /* 빨간 휴지통 */
+[class*="st-key-del_img_"] button span { filter: drop-shadow(0 0 2px rgba(255, 255, 255, 0.95)); transition: transform .12s; }   /* 사진 위에서도 또렷하게 */
+[class*="st-key-del_img_"] button p { display: none; }   /* 글자는 숨기고 아이콘만 보인다 (설명은 마우스를 올리면 나온다) */
+[class*="st-key-del_img_"] button:hover, [class*="st-key-del_img_"] button:focus:not(:active) { background: transparent !important; border: none !important; box-shadow: none !important; }
+[class*="st-key-del_img_"] button:hover * { color: #B71C1C !important; }
+[class*="st-key-del_img_"] button:hover span { transform: scale(1.12); }
+/* 사진 업로드 칸의 파일 이름표 목록은 숨긴다: 지우는 곳은 원본 사진 옆 아이콘 하나로 통일한다 (영상은 이름표의 X 를 그대로 쓴다) */
+[class*="st-key-result_uploader_img"] [data-testid="stFileUploaderFile"],
+[class*="st-key-result_uploader_img"] [data-testid="stFileUploaderPagination"],
+[class*="st-key-upload_full_img"] [data-testid="stFileUploaderFile"],
+[class*="st-key-upload_full_img"] [data-testid="stFileUploaderPagination"] { display: none; }
+
+/* ---- 실시간 주소 목록: 등록한 주소·파일이 한 줄씩. 고른 것 하나만 처리한다 ---- */
+[class*="st-key-stream_files"] { margin-top: .6rem; }
+[class*="st-key-stream_files"] [data-testid="stFileUploaderFile"],
+[class*="st-key-stream_files"] [data-testid="stFileUploaderPagination"] { display: none; }   /* 올린 파일은 아래 등록 목록에 나오므로 이름표 목록은 숨긴다 */
+[class*="st-key-src_list"] { display: flex; flex-direction: column; gap: .45rem; margin-top: .9rem; }
+[class*="st-key-src_row_"] { display: flex !important; flex-direction: row !important; align-items: center; gap: .5rem; width: 100%; }
+[class*="st-key-src_row_"] > div { width: auto !important; flex: 0 0 auto; }
+[class*="st-key-src_row_"] > div:first-child { flex: 1 1 0; min-width: 0; }
+[class*="st-key-src_row_"] > div:first-child .stButton { width: 100%; }
+[class*="st-key-src_pick_"] .stButton button { width: 100%; min-height: 2.5rem; padding: .35rem 1.2rem; }
+[class*="st-key-src_pick_"] .stButton button p { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; font-size: .9rem; }
+[class*="st-key-src_pick_off_"] .stButton button { background: #fff; border: 1px solid var(--line); }
+[class*="st-key-src_pick_off_"] .stButton button * { color: var(--ink) !important; }
+[class*="st-key-src_pick_off_"] .stButton button:hover { background: var(--sky-soft); border: 1px solid var(--line); }
+[class*="st-key-src_pick_on_"] .stButton button { background: var(--select); border: 1px solid transparent; }
+[class*="st-key-src_pick_on_"] .stButton button * { color: var(--select-ink) !important; font-weight: 700; }
+[class*="st-key-src_pick_on_"] .stButton button:hover { background: var(--select); border: 1px solid transparent; filter: brightness(.96); }
+[class*="st-key-src_del_"] .stButton button {
+    width: 2.2rem; height: 2.2rem; min-height: 0; padding: 0; border-radius: 50%; background: #fff; border: 1px solid var(--line);
+}
+[class*="st-key-src_del_"] .stButton button * { color: var(--muted) !important; font-size: 1.05rem; }
+[class*="st-key-src_del_"] .stButton button p { display: none; }
+[class*="st-key-src_del_"] .stButton button:hover { background: #FDECEC; border: 1px solid #F3C4C4; }
+[class*="st-key-src_del_"] .stButton button:hover * { color: #C0392B !important; }
+.src-hint { color: var(--muted); font-size: .85rem; margin: .7rem 0 0; text-align: center; word-break: keep-all; }
+
+/* ---- 실시간 원본·결과 화면: 사진/영상 탭과 같은 16:9 칸 (프레임이 달라도 칸 크기가 같다) ---- */
+[class*="st-key-live_view"] [data-testid="stImage"] img { width: 100%; aspect-ratio: 16 / 9; object-fit: contain; }
+.live-ph {
+    width: 100%; aspect-ratio: 16 / 9; box-sizing: border-box; display: flex; align-items: center; justify-content: center; text-align: center;
+    background: var(--mint-soft); border: 1px dashed var(--mint-line); border-radius: 12px; color: var(--muted); font-size: .9rem;
 }
 
 </style>
@@ -656,6 +783,11 @@ def init_session_state() -> None:
     st.session_state.setdefault("live_last", None)        # 끝난 실시간 처리의 마지막 화면 (원본·결과 프레임, 정보)
     st.session_state.setdefault("live_error", None)       # 실시간 처리가 오류로 끝났을 때의 안내 (종류, 내용)
     st.session_state.setdefault("video_edit", None)       # 영상 편집 상태 (처리한 영상의 박스·사람별 해제/가림·직접 영역). 사진의 image_results 와 같은 역할
+    st.session_state.setdefault("removed_files", set())   # 사용자가 원본 목록에서 지운 사진의 file_id (업로드 칸에는 남아 있어서 따로 기억해 걸러 낸다)
+    st.session_state.setdefault("auto_apply", set())      # 등록 해제 직후 결과를 바로 다시 만들어야 하는 처리 종류의 적용 버튼 열쇠 ("run_image" · "run_video")
+    st.session_state.setdefault("stream_sources", [])     # 등록한 실시간 주소·파일 [{"id", "label", "source", "fid"}]. 처리는 고른 하나만 한다
+    st.session_state.setdefault("stream_selected", None)  # 그중 처리하려고 고른 것의 id
+    st.session_state.setdefault("stream_removed", set())  # 지운 실시간 파일의 file_id (업로드 칸에 남아 있어도 다시 등록하지 않게)
 
 
 def get_workdir() -> Path:
@@ -1732,8 +1864,99 @@ PAGING_JS = """
     var idx = Array.prototype.indexOf.call(label.parentNode.querySelectorAll('label[data-baseweb="radio"]'), label);
     page(m, idx === 0 ? a[0] : a[1]);                           // 메인 -> 첫 화면, 인물 등록 -> 등록 화면 맨 위
   }, true);
+
+  // 하단 바 가운데 로고를 눌렀는지. 로고는 하단 바의 ::before 라서 클릭이 하단 바 자체로 들어온다 -> 로고 자리 안인지 좌표로 가른다. (MODAL_JS 도 쓴다)
+  function onLogo(e, bar) {
+    var cs = getComputedStyle(bar, '::before'), w = parseFloat(cs.width) || 62, h = parseFloat(cs.height) || 29;
+    var r = bar.getBoundingClientRect(), cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    return Math.abs(e.clientX - cx) <= w / 2 + 10 && Math.abs(e.clientY - cy) <= h / 2 + 12;
+  }
+  window.__tyOnLogo = onLogo;
+
+  // '스크롤하세요' 안내나 하단 바의 빈 곳을 누르기만 해도 한 화면 아래로 부드럽게 내려간다. (메뉴 버튼과 로고는 제외)
+  document.addEventListener('click', function (e) {
+    var t = e.target;
+    if (!t || !t.closest) return;
+    var bar = t.closest('[class*="st-key-bottom_bar"]');
+    var blankBar = bar && !t.closest('label') && !onLogo(e, bar);
+    if (!t.closest('.scroll-hint') && !blankBar) return;
+    var m = main();
+    if (!m || locked) return;
+    var to = target(m, 1);                                       // 한 화면씩 넘기는 구간이면 다음 화면으로
+    if (to === null) to = Math.min(m.scrollTop + m.clientHeight * 0.9, m.scrollHeight - m.clientHeight);   // 평소 스크롤 구간이면 한 화면 가까이 아래로
+    if (to > m.scrollTop + 4) page(m, to);
+  }, false);
 })();
 """
+
+# TRIPLE Y 소개 창의 내용 (HTML). 로고를 누르면 MODAL_JS 가 이것을 창으로 띄운다. 팀·역할은 CLAUDE.md 의 역할 표, 기술은 README 의 '핵심 기술'을 따른다.
+MODAL_HTML = (
+    '<div class="ty-modal-box">'
+    '<button class="ty-modal-close" type="button" aria-label="닫기">✕</button>'
+    '<div class="ty-modal-head"><img src="/app/static/yyy_logo.png" alt="TRIPLE Y"><h2 class="ty-modal-title">TRIPLE Y MINI</h2></div>'
+    '<p class="ty-modal-lead">얼굴은 가리고, 순간은 남기다. 사진·영상·실시간 방송 속 얼굴을 자동으로 찾아 모자이크하는 서비스예요.</p>'
+    "<h3>프로젝트 개요</h3>"
+    "<p>YOLO11 얼굴 탐지로 사진·영상·실시간 주소(RTSP·유튜브 라이브)의 얼굴을 찾아 모자이크나 블러로 가립니다. "
+    "본인처럼 가리고 싶지 않은 인물은 미리 등록해 두면 InsightFace 얼굴 인식으로 알아보고 모자이크에서 제외해요. "
+    "애매하면 언제나 모자이크하는 쪽을 택해, 잘못 알아봐서 다른 사람의 얼굴이 드러나는 일을 막는 것을 가장 먼저 지킵니다. "
+    "3명이 2주 동안 만든 팀 프로젝트입니다.</p>"
+    "<h3>팀 소개</h3>"
+    '<div class="ty-team">'
+    '<div class="ty-member"><b><em>A</em>이유노</b><span>모델 · 데이터 · 평가<br>얼굴 탐지(YOLO)와 성능 평가</span></div>'
+    '<div class="ty-member"><b><em>B</em>조영준</b><span>모자이크 · 영상 · 실시간<br>영상 처리와 실시간 스트림</span></div>'
+    '<div class="ty-member"><b><em>C</em>나예린</b><span>웹 · 인물 제외<br>웹 데모와 특정 인물 제외</span></div>'
+    "</div>"
+    "<h3>기술 스택</h3>"
+    '<div class="ty-stack">'
+    '<span class="ty-chip main">YOLO11 (Ultralytics)</span><span class="ty-chip main">InsightFace</span>'
+    '<span class="ty-chip">ByteTrack</span><span class="ty-chip">OpenCV</span><span class="ty-chip">ONNX Runtime</span>'
+    '<span class="ty-chip">FFmpeg</span><span class="ty-chip">yt-dlp</span><span class="ty-chip">Streamlit</span><span class="ty-chip">Python</span>'
+    "</div>"
+    "</div>"
+)
+
+# 소개 창 스크립트: Streamlit 위쪽 문서(parent)에 한 번만 심는다. 창은 <body> 에 직접 붙여서 화면을 다시 그려도 사라지지 않는다.
+# 로고(하단 바 가운데)나 상단 바 제목을 누르면 열리고, X 버튼 · 창 바깥(어두운 배경) · Esc 로 닫힌다.
+MODAL_JS = """
+(function () {
+  if (window.__tyModal) return;
+  window.__tyModal = true;
+  var wrap = document.createElement('div');
+  wrap.className = 'ty-modal';
+  wrap.setAttribute('role', 'dialog');
+  wrap.setAttribute('aria-modal', 'true');
+  wrap.setAttribute('aria-label', 'TRIPLE Y 소개');
+  wrap.innerHTML = __HTML__;
+  document.body.appendChild(wrap);
+
+  var opener = null;
+  function open() {
+    opener = document.activeElement;
+    wrap.classList.add('open');
+    var btn = wrap.querySelector('.ty-modal-close');
+    if (btn) btn.focus();
+  }
+  function close() {
+    wrap.classList.remove('open');
+    if (opener && opener.focus) { try { opener.focus(); } catch (err) {} }
+  }
+  wrap.addEventListener('click', function (e) {
+    if (e.target === wrap || (e.target.closest && e.target.closest('.ty-modal-close'))) close();    // 어두운 배경(창 바깥)이나 X 버튼
+  });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && wrap.classList.contains('open')) close(); });
+
+  document.addEventListener('click', function (e) {
+    if (wrap.contains(e.target)) return;
+    var t = e.target;
+    var topH = parseFloat(getComputedStyle(document.documentElement).fontSize) * 2.6;      // 상단 바 높이(2.6rem)
+    // 상단 바의 TRIPLE Y MINI 제목. 상단 바는 .stApp 의 ::before 라서 클릭 대상이 .stApp 자체다. (키보드·스크립트로 만든 클릭은 좌표가 0 이고 대상이 버튼이라 제외된다)
+    if (t.classList && t.classList.contains('stApp') && e.clientY <= topH) { open(); return; }
+    var bar = t.closest && t.closest('[class*="st-key-bottom_bar"]');
+    if (bar && !t.closest('label') && window.__tyOnLogo && window.__tyOnLogo(e, bar)) open();   // 하단 바 가운데 로고
+  }, false);
+})();
+"""
+
 
 
 def request_scroll(target: str) -> None:
@@ -1778,6 +2001,22 @@ def inject_paging_script() -> None:
         "</script>",
         height=0,
     )
+
+def inject_modal_script() -> None:
+    """TRIPLE Y 소개 창 스크립트를 화면에 심는다. (이미 심었으면 아무 일도 안 한다)"""
+    code = MODAL_JS.replace("__HTML__", json.dumps(MODAL_HTML))
+    components.html(
+        "<script>"
+        "const doc = window.parent.document;"
+        "if (!doc.getElementById('ty-modal-js')) {"
+        "  const s = doc.createElement('script'); s.id = 'ty-modal-js';"
+        f"  s.textContent = {json.dumps(code)};"
+        "  doc.head.appendChild(s);"
+        "}"
+        "</script>",
+        height=0,
+    )
+
 
 def render_metrics_card() -> None:
     """[메인] 아래쪽 '성능 지표' 카드: 이 접속에서 처리한 기록의 요약 수치와 최근 기록 표를 보여 준다."""
@@ -1900,6 +2139,43 @@ def sync_pick_registrations(mode: str, files: list[UploadedFile]) -> None:
                        lambda person=person, xyxy=xyxy, frame=view["frame"]: embed_track(person_shots(files[0], edit["analysis"], person, frame, xyxy)))
     if changed:
         sync_ref_embs()
+        if mode == MODE_IMAGE:
+            propagate_registrations(files)    # 한 사진에서 등록한 사람을 이미 처리한 다른 사진에도 바로 반영한다
+
+
+def propagate_registrations(files: list[UploadedFile]) -> None:
+    """얼굴 클릭으로 등록 인물이 바뀌었을 때, 이미 처리해 둔 다른 사진의 결과에도 지금의 등록 인물(전체)을 바로 반영한다.
+
+    등록한 얼굴 벡터(ref_embs)는 앱 전체에서 하나지만, 처리가 끝난 사진의 결과는 그때의 등록 인물로 만든 것이라 다시 적용하기 전까지 옛 설정 그대로다.
+    그래서 사진마다 저장해 둔 탐지 박스를 지금의 등록 인물로 다시 판정하고(얼굴을 다시 찾지 않아 빠르다), 제외 얼굴이 달라진 사진만 결과를 새로 만든다.
+    사용자가 그 사진에서 얼굴을 직접 클릭해 고쳤거나 직접 영역을 그렸다면 그 내용이 사라지지 않게 건드리지 않는다(방금 클릭한 사진도 여기에 든다).
+    """
+    from src.exclude import filter_excluded
+
+    ref_embs = active_ref()
+    by_id = {f.file_id: f for f in files}
+    for entry in st.session_state["image_results"].values():
+        uploaded = by_id.get(entry["fid"])
+        if uploaded is None:
+            continue
+        parsed = parse_edit(st.session_state.get(picker_key(entry)), entry["edit"], set(range(len(entry["detected"]))), entry["src_size"])
+        if set(parsed["excluded"]) != set(entry["init_edit"]["excluded"]) or parsed["manual"]:    # 이 사진에서 직접 고친 내용이 있다
+            continue
+        image_rgb = decode_image_rgb(uploaded)
+        boxes = [{"xyxy": d["xyxy"], "conf": d["conf"], "track_id": None} for d in entry["detected"]]
+        if ref_embs is None:    # 등록한 사람이 없으면 아무도 제외하지 않는다
+            kept = {tuple(b["xyxy"]) for b in boxes}
+        else:
+            kept = {tuple(b["xyxy"]) for b in filter_excluded(cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR), boxes, ref_embs)}
+        detected = [dict(d, auto_excluded=tuple(d["xyxy"]) not in kept) for d in entry["detected"]]
+        edit = default_edit(detected)
+        if edit == entry["init_edit"]:    # 이 사진은 달라질 것이 없다
+            continue
+        h, w = image_rgb.shape[:2]
+        shown = resolve_boxes(detected, edit, w, h)
+        st.session_state["run_counter"] += 1    # 얼굴 선택 칸의 이름표(picker_key)가 바뀌어 새 제외 목록으로 칸이 새로 만들어진다
+        entry.update(write_result(on_mask(image_rgb, shown, entry["effect"]), entry["base"], entry["effect"]))
+        entry.update(detected=detected, init_edit=edit, edit=edit, faces=len(shown), run=st.session_state["run_counter"])
 
 
 def person_shots(uploaded: UploadedFile, analysis: object, person: int, frame: int, xyxy: tuple) -> list[tuple[np.ndarray, tuple]]:
@@ -1941,7 +2217,7 @@ def render_file_tab() -> None:
     올린 뒤에는 가운데의 작은 Browse files 버튼(과 파일 이름)으로 줄어든다.
     """
     mode = st.session_state.get("mode", MODE_IMAGE)    # 아래 라디오가 만들어지기 전에도 현재 값을 알아야 한다
-    files = as_file_list(st.session_state.get(f"uploader_{mode}"))
+    files = target_files(mode)
     has_files = bool(files)
     signature = tuple(f.file_id for f in files)
     if has_files and signature != st.session_state.get("files_signature"):    # 새 파일을 올렸다
@@ -1960,8 +2236,11 @@ def render_file_tab() -> None:
         if mode == MODE_STREAM:
             url = render_stream_url()
         else:
-            with st.container(key="result_uploader" if has_files else "upload_full"):    # 올린 뒤에는 CSS 가 작은 버튼으로 줄인다
+            suffix = "_img" if mode == MODE_IMAGE else ""    # 사진은 파일 이름표 목록을 CSS 가 숨긴다 (지우는 곳은 원본 사진 옆 아이콘)
+            with st.container(key=("result_uploader" if has_files else "upload_full") + suffix):    # 올린 뒤에는 CSS 가 작은 버튼으로 줄인다
                 render_uploader(mode)
+            if mode == MODE_VIDEO:
+                render_video_picker()
             if not has_files:
                 st.caption("파일을 올리면 아래에 원본과 모자이크 결과가 나란히 표시됩니다.")
 
@@ -1986,7 +2265,7 @@ def render_file_tab() -> None:
 
 
 def render_uploader(mode: str) -> None:
-    """종류(사진·영상)에 맞는 파일 선택 칸을 그린다. 사진은 여러 장을 한 번에 올릴 수 있다.
+    """종류(사진·영상)에 맞는 파일 선택 칸을 그린다. 사진·영상 모두 여러 개를 올릴 수 있다(영상은 그중 고른 하나만 처리).
 
     올린 파일은 반환값 대신 st.session_state["uploader_종류"] 에서 꺼내 쓴다.
     """
@@ -1994,10 +2273,52 @@ def render_uploader(mode: str) -> None:
     st.file_uploader(
         "사진을 선택하세요" if is_image else "영상을 선택하세요",
         type=IMAGE_TYPES if is_image else VIDEO_TYPES,
-        accept_multiple_files=is_image,
+        accept_multiple_files=True,
         key=f"uploader_{mode}",    # 종류마다 다른 이름표를 써서, 종류를 바꾸면 이전 파일이 남지 않게 한다
-        help=f"이미지: jpg, png (최대 {MAX_IMAGE_FILES}장)" if is_image else "영상: mp4 (1분·720p 이하)",
+        help=f"이미지: jpg, png (최대 {MAX_IMAGE_FILES}장)" if is_image else f"영상: mp4 (1분·720p 이하, 최대 {MAX_VIDEO_FILES}개까지 올리고 하나씩 처리)",
     )
+
+
+def target_files(mode: str) -> list[UploadedFile]:
+    """이번에 처리 대상으로 볼 파일 목록.
+
+    사진은 업로드 칸의 파일에서 사용자가 원본 목록에서 지운 것(removed_files)을 뺀 것이다. 업로드 칸에는 지운 파일이 그대로 남아 있어서 따로 걸러 낸다.
+    영상은 올린 여러 개 중 고른 하나(video_pick)만 돌려준다. 동시에 여러 개를 처리하지 않게 하려는 것이다.
+    """
+    files = as_file_list(st.session_state.get(f"uploader_{mode}"))
+    if mode == MODE_IMAGE:
+        removed = st.session_state["removed_files"]
+        return [f for f in files if f.file_id not in removed]
+    if mode == MODE_VIDEO and files:
+        files = files[:MAX_VIDEO_FILES]
+        by_id = {f.file_id: f for f in files}
+        return [by_id.get(st.session_state.get("video_pick"), files[0])]
+    return files
+
+
+def render_video_picker() -> None:
+    """영상을 둘 이상 올렸을 때, 처리할 영상 하나를 고르는 칸을 그린다. (하나뿐이면 그리지 않는다)"""
+    files = as_file_list(st.session_state.get(f"uploader_{MODE_VIDEO}"))[:MAX_VIDEO_FILES]
+    if len(files) < 2:
+        return
+    ids = [f.file_id for f in files]
+    names = {f.file_id: f"{i + 1}. {f.name}" for i, f in enumerate(files)}
+    if st.session_state.get("video_pick") not in ids:    # 지웠거나 처음이면 첫 영상
+        st.session_state["video_pick"] = ids[0]
+    st.selectbox("처리할 영상 (한 번에 하나만 처리해요)", ids, format_func=names.__getitem__, key="video_pick")
+
+
+def remove_image(file_id: str) -> None:
+    """원본 사진 옆 삭제 아이콘의 콜백. 사진 한 장을 처리 대상에서 빼고 그 사진의 처리 결과를 지운다.
+
+    나머지 사진의 결과와 등록한 인물은 그대로 둔다. 그래서 파일 구성이 바뀐 것으로 보고 모든 결과를 비우는 files_signature 도 새 구성에 맞춰 둔다.
+    (업로드 칸에서는 파일을 지울 수 없어서 removed_files 에 적어 걸러 낸다)
+    """
+    st.session_state["removed_files"].add(file_id)
+    results = st.session_state["image_results"]
+    for key in [key for key, entry in results.items() if entry["fid"] == file_id]:
+        del results[key]
+    st.session_state["files_signature"] = tuple(f.file_id for f in target_files(MODE_IMAGE))
 
 
 def image_result_key(uploaded: UploadedFile) -> str:
@@ -2053,6 +2374,9 @@ def render_result_card(mode: str, files: list[UploadedFile]) -> None:
     effect = st.session_state.get("effect", EFFECT_MOSAIC)
     apply_key = "run_image" if is_image else "run_video"
     apply_clicked = bool(st.session_state.get(apply_key, False))    # 버튼은 아래에서 만들지만 눌렸는지는 지금 알 수 있다
+    if apply_key in st.session_state["auto_apply"]:    # 등록을 해제했다: 적용을 누른 것처럼 새 설정으로 결과를 바로 다시 만든다 (release_people)
+        st.session_state["auto_apply"].discard(apply_key)
+        apply_clicked = True
 
     head = st.container(key="result_head")
     options = st.container()
@@ -2246,6 +2570,12 @@ def render_image_rows(entries: list[tuple[UploadedFile, np.ndarray]], effect: st
                     detected=entry["detected"], excluded=entry["init_edit"]["excluded"], manual=[],
                     reset_excluded=entry["init_edit"]["excluded"], token=picker_key(entry),
                 )
+            lay = canvas_layout(w, h)    # 사진은 칸 안에서 가운데에 비율대로 놓여 칸보다 작을 수 있다. 실제 사진의 오른쪽 위 구석(칸 크기에 대한 %)을 CSS 에 알려 준다
+            top_pct, right_pct = lay["y"] / lay["ch"] * 100, (lay["cw"] - lay["x"] - lay["w"]) / lay["cw"] * 100
+            with st.container(key=f"del_img_{idx}"):    # 원본 사진 칸 위에 겹치는 투명한 층. 안의 휴지통 아이콘만 보인다 (CSS)
+                st.button("삭제", key=f"del_btn_{uploaded.file_id}", icon=":material/delete:", help="이 사진을 목록에서 삭제",
+                          on_click=remove_image, args=(uploaded.file_id,))
+                st.markdown(f"<style>.st-key-del_img_{idx} {{ --del-top: {top_pct:.2f}%; --del-right: {right_pct:.2f}%; }}</style>", unsafe_allow_html=True)
         result_rgb = load_result_rgb(entry["path"]) if entry else None
         has_result = entry is not None and result_rgb is not None
         if has_result:
@@ -2283,6 +2613,11 @@ def render_image_rows(entries: list[tuple[UploadedFile, np.ndarray]], effect: st
                                mime="application/zip", key="save_zip")
 
     render_apply_row(apply_key, effect, render_save)
+    if saved_rows:    # 등록 인물인데 가려진 얼굴(작거나 옆으로 돌아 유사도가 기준에 못 미친 경우)은 클릭해 풀면 그 얼굴이 등록돼 다음 처리부터 더 잘 알아본다 (sync_pick_registrations)
+        st.caption(
+            "등록한 인물인데 가려졌다면 원본에서 그 얼굴을 클릭해 풀어 주세요. 그 얼굴이 추가로 등록돼 다음 처리부터 더 잘 알아봐요. "
+            f"(얼굴이 {MIN_VERIFY_SIZE}px보다 작거나 많이 돌아가 있으면 등록되지 않고 이번 사진에서만 풀려요)"
+        )
     if info_lines and result_dir is not None:
         render_result_info(info_lines, result_dir)
 
@@ -2540,7 +2875,8 @@ def render_video_rows(uploaded: UploadedFile, ui: JobUI, effect: str, apply_key:
             )
         st.caption(
             f"얼굴을 클릭하면 {effect}가 해제되고 다시 클릭하면 가려져요. 빈 곳을 끌면 그 자리를 가리는 직접 영역이 생기고, 지우면 빠져요. "
-            "고친 내용은 '적용 구간'에만 들어가요(처음엔 영상 전체)."
+            "고친 내용은 '적용 구간'에만 들어가요(처음엔 영상 전체). "
+            "등록한 인물인데 가려졌다면 그 얼굴을 클릭해 풀어 주세요. 적용 구간이 영상 전체일 때는 그 사람이 추가로 등록돼 다음 처리부터 더 잘 알아봐요."
         )
         if video_edit_snapshot(edit) != edit["applied"]:
             st.info(f"고친 내용이 있어요. 아래 '{effect} 적용' 버튼을 누르면 결과 영상에 반영돼요.")
@@ -2572,22 +2908,103 @@ def render_video_rows(uploaded: UploadedFile, ui: JobUI, effect: str, apply_key:
         render_result_info(lines, out.parent)
 
 
-def render_stream_url() -> str:
-    """실시간 주소 입력칸과 [등록] 버튼을 그리고, 확인한 주소를 돌려준다. 아직 확인하지 않았으면 빈 문자열.
+def stream_label(text: str) -> str:
+    """주소·파일 이름을 목록 버튼 글자로 쓰게 다듬는다: 앞의 http(s):// 를 떼고 길면 줄이며, 버튼 글자가 마크다운으로 해석되지 않게 특수문자를 막는다."""
+    text = re.sub(r"^https?://", "", text.strip())
+    text = text if len(text) <= 60 else text[:57] + "..."
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!~<>|$:])", r"\\\1", text)
 
+
+def add_stream_source(source: str, label: str, fid: Optional[str] = None) -> bool:
+    """등록 목록에 주소·파일을 더하고 방금 더한 것을 고른 상태로 만든다. 이미 있는 주소면 새로 더하지 않고 그것을 고른다. 더했거나 골랐으면 True, 가득 찼으면 False."""
+    sources = st.session_state["stream_sources"]
+    same = next((s for s in sources if s["source"] == source), None)
+    if same is not None:
+        st.session_state["stream_selected"] = same["id"]
+        return True
+    if len(sources) >= MAX_STREAM_SOURCES:
+        return False
+    st.session_state["stream_seq"] = st.session_state.get("stream_seq", 0) + 1
+    new_id = f"s{st.session_state['stream_seq']}"
+    sources.append({"id": new_id, "label": label, "source": source, "fid": fid})
+    st.session_state["stream_selected"] = new_id
+    return True
+
+
+def select_stream_source(source_id: str) -> None:
+    """목록의 주소·파일 버튼 콜백. 처리할 하나를 이것으로 바꾼다. 돌던 처리는 render_stream_compare 가 주소가 달라진 것을 보고 멈춘다."""
+    if st.session_state["stream_selected"] != source_id:
+        st.session_state["stream_selected"] = source_id
+        st.session_state["live_last"] = None    # 이전 주소의 마지막 화면과 오류는 새로 고른 것과 상관없다
+        st.session_state["live_error"] = None
+
+
+def remove_stream_source(source_id: str) -> None:
+    """목록의 삭제 아이콘 콜백. 등록을 지운다. 지운 것이 골라 둔 것이면 남은 것 중 첫 번째를 고른다(없으면 고른 것 없음)."""
+    sources = st.session_state["stream_sources"]
+    for src in sources:
+        if src["id"] == source_id and src.get("fid"):
+            st.session_state["stream_removed"].add(src["fid"])    # 업로드 칸에 남아 있어도 다시 등록하지 않는다
+    sources[:] = [s for s in sources if s["id"] != source_id]
+    if st.session_state["stream_selected"] == source_id:
+        st.session_state["stream_selected"] = sources[0]["id"] if sources else None
+        st.session_state["live_last"] = None
+        st.session_state["live_error"] = None
+
+
+def render_stream_url() -> str:
+    """실시간 주소 입력칸·[등록] 버튼·영상 파일 등록 칸과 등록 목록을 그리고, 처리하려고 고른 주소(또는 파일 경로)를 돌려준다. 고른 것이 없으면 빈 문자열.
+
+    주소는 여러 개 등록해 둘 수 있지만 처리는 목록에서 고른 하나만 한다(여러 스트림을 동시에 돌리면 과부하). 다른 것을 고르면 돌던 처리는 멈춘다.
     입력칸과 버튼을 한 폼으로 묶어서, [등록] 버튼을 눌러도 엔터를 눌러도 입력한 값이 한 번에 넘어온다. (폼이 아니면 입력칸을 벗어나는 순간
-    화면이 한 번 다시 그려지면서 곧바로 이어지는 버튼 클릭을 놓칠 수 있다.) 확인한 주소가 있어야 아래의 인물 등록과 비교 영역이 나타난다.
+    화면이 한 번 다시 그려지면서 곧바로 이어지는 버튼 클릭을 놓칠 수 있다.) 고른 것이 있어야 아래의 인물 등록과 비교 영역이 나타난다.
     """
+    notice = ""
     with st.container(key="stream_url_row"):
-        with st.form("stream_url_form", border=False):
+        with st.form("stream_url_form", border=False, clear_on_submit=True):    # 등록하면 입력칸을 비워 다음 주소를 바로 적게 한다
             col_input, col_apply = st.columns([6, 1], vertical_alignment="bottom")
             with col_input:
                 typed = st.text_input("실시간 주소", placeholder="실시간 주소를 입력하세요", key="stream_url").strip()
             with col_apply:
                 submitted = st.form_submit_button("등록")
-        if submitted:
-            st.session_state["stream_url_applied"] = typed
-    return st.session_state.get("stream_url_applied", "")
+        if submitted and typed and not add_stream_source(typed, typed):
+            notice = f"주소·파일은 {MAX_STREAM_SOURCES}개까지 등록할 수 있어요. 안 쓰는 것을 삭제한 뒤 다시 등록해 주세요."
+
+    with st.container(key="stream_files"):    # 영상 파일도 같은 목록에 등록한다 (파일 이름표 목록은 CSS 가 숨기고, 아래 등록 목록 하나로 보여 준다)
+        uploads = st.file_uploader("또는 영상 파일 등록", type=VIDEO_TYPES, accept_multiple_files=True, key="uploader_stream_files",
+                                   help="mp4 파일을 올리면 같은 목록에 등록돼요. 파일은 되풀이해서 재생하며 처리해요.")
+    known = {s.get("fid") for s in st.session_state["stream_sources"]}
+    for uploaded in as_file_list(uploads):
+        if uploaded.file_id in known or uploaded.file_id in st.session_state["stream_removed"]:
+            continue
+        folder = get_workdir() / "stream_files"
+        folder.mkdir(exist_ok=True)
+        path = folder / f"src_{uploaded.file_id[:12]}{Path(uploaded.name).suffix.lower()}"    # 한글 이름은 영상 열기가 실패할 수 있어 영문 이름으로 저장한다
+        path.write_bytes(uploaded.getvalue())
+        if not add_stream_source(str(path), uploaded.name, uploaded.file_id):
+            notice = f"주소·파일은 {MAX_STREAM_SOURCES}개까지 등록할 수 있어요. 안 쓰는 것을 삭제한 뒤 다시 올려 주세요."
+            break
+    if notice:
+        st.warning(notice)
+
+    sources = st.session_state["stream_sources"]
+    selected = st.session_state["stream_selected"]
+    if sources and selected not in {s["id"] for s in sources}:
+        selected = st.session_state["stream_selected"] = sources[0]["id"]
+    if sources:
+        with st.container(key="src_list"):
+            for i, src in enumerate(sources):
+                on = src["id"] == selected
+                with st.container(key=f"src_row_{i}"):
+                    with st.container(key=f"src_pick_{'on' if on else 'off'}_{i}"):    # 고른 것은 CSS 가 선택 색으로 바꾼다
+                        st.button(("✓ " if on else "") + stream_label(src["label"]), key=f"src_sel_{src['id']}", help=src["label"],
+                                  on_click=select_stream_source, args=(src["id"],))
+                    with st.container(key=f"src_del_{i}"):
+                        st.button("삭제", key=f"src_rm_{src['id']}", icon=":material/delete:", help="이 주소를 목록에서 삭제",
+                                  on_click=remove_stream_source, args=(src["id"],))
+        st.markdown('<p class="src-hint">등록한 것 중 고른 하나만 처리해요. 다른 것을 고르면 지금 처리하던 것은 멈춰요.</p>', unsafe_allow_html=True)
+    chosen = next((s for s in sources if s["id"] == selected), None)
+    return chosen["source"] if chosen else ""
 
 
 class LiveJob:
@@ -2716,6 +3133,15 @@ def draw_live_pair(pair: tuple, info: dict, effect: str) -> None:
         st.caption(f"현재 얼굴 {info['faces_now']}개 · 누적 {info['faces_total']}명 · {info['fps']:.1f} FPS")
 
 
+def draw_live_placeholder(text: str) -> None:
+    """원본·결과 자리를 사진/영상 탭과 같은 크기(16:9)의 빈 칸 두 개로 보여 준다. 연결 중이거나 아직 시작하지 않았을 때 화면이 들쭉날쭉하지 않게 한다."""
+    col_orig, col_result = st.columns(2)
+    with col_orig:
+        st.markdown(f'<div class="live-ph">{text}</div>', unsafe_allow_html=True)
+    with col_result:
+        st.markdown('<div class="live-ph"></div>', unsafe_allow_html=True)
+
+
 @st.fragment(run_every=LIVE_VIEW_REFRESH)
 def render_live_fragment(job: LiveJob) -> None:
     """도는 실시간 처리의 최신 프레임을 LIVE_VIEW_REFRESH 초마다 가져와 그린다. 화면 전체를 다시 그리지 않아 모자이크/블러를 바꿔도 끊기지 않는다.
@@ -2728,7 +3154,7 @@ def render_live_fragment(job: LiveJob) -> None:
     if pair is not None:
         draw_live_pair(pair, info, job.effect)
     else:
-        st.markdown('<div class="finding">실시간 스트림에 연결하는 중...</div>', unsafe_allow_html=True)
+        draw_live_placeholder("실시간 스트림에 연결하는 중...")
     if done:
         st.rerun()
 
@@ -2741,8 +3167,9 @@ def render_stream_compare(url: str) -> None:
     """
     settle_live()
     job = st.session_state.get("live")
-    if job is not None and job.url != url:    # 다른 주소를 확인했다
+    if job is not None and job.url != url:    # 다른 주소를 골랐다: 돌던 처리는 멈추고 그 주소의 마지막 화면도 지운다
         stop_live()
+        st.session_state["live_last"] = None
         job = None
     effect = st.session_state.get("effect", EFFECT_MOSAIC)
     render_card_heading("원본과 결과 비교", f"왼쪽이 원본, 오른쪽이 {effect} 결과입니다.")
@@ -2751,7 +3178,7 @@ def render_stream_compare(url: str) -> None:
     if job is not None:
         job.effect = effect    # 도는 중에도 다음 프레임부터 바로 반영된다
 
-    view = st.container()    # 원본·결과 자리. 버튼 처리가 끝난 뒤 채운다
+    view = st.container(key="live_view")    # 원본·결과 자리 (CSS 가 사진/영상 탭과 같은 16:9 칸으로 맞춘다). 버튼 처리가 끝난 뒤 채운다
     with st.container(key="stream_start"):    # 파일 선택(Browse files) 버튼과 같은 모양으로 가운데에 놓는다
         if job is None:
             if st.button("실시간 시작", key="run_stream"):
@@ -2767,6 +3194,8 @@ def render_stream_compare(url: str) -> None:
         elif st.session_state.get("live_last") is not None:
             pair, info = st.session_state["live_last"]
             draw_live_pair(pair, info, effect)
+        else:
+            draw_live_placeholder("[실시간 시작]을 누르면 여기에 원본이 나와요")
     error = st.session_state.get("live_error")
     if error is not None and job is None:
         if error[0] == "module":
@@ -2813,27 +3242,64 @@ def find_registered_person(embs: np.ndarray) -> Optional[tuple]:
     return best_key
 
 
-def toggle_candidate(cand_key: tuple, embs: np.ndarray, thumb_bgr: np.ndarray) -> None:
-    """후보의 '등록' 태그 버튼 콜백. 꺼져 있으면 이 사람을 등록하고(켜짐), 이미 등록된 사람이면 그 사람만 해제한다(꺼짐).
+def find_registered_people(embs: np.ndarray) -> list[tuple]:
+    """등록한 사람 중 embs 와 같은 사람으로 볼 만큼(SIM_THRESHOLD 이상) 닮은 사람의 열쇠를 모두 돌려준다. 없으면 [].
 
-    이미 등록된 사람인지는 후보 번호가 아니라 얼굴이 닮았는지(find_registered_person)로 본다. 그래서 '유지'한 사람이 새 파일의 후보에서도
-    '✓ 등록됨'으로 보이고, 눌러서 해제할 수 있다. 사람마다 따로 켜고 끌 수 있어서 여러 명을 등록할 수 있다. 등록한 사람은 모두 모자이크에서 빠진다.
+    같은 사람이 후보 등록과 얼굴 클릭 등록으로 따로 올라가 있을 수 있다(열쇠가 다르다). 해제할 때 그 모두를 찾아 지우려고 쓴다.
+    """
+    cand = unit_rows(embs)
+    return [key for key, person in st.session_state["ref_people"].items()
+            if float(np.max(unit_rows(person["embs"]) @ cand.T)) >= SIM_THRESHOLD]
+
+
+def release_people(keys: list[tuple]) -> None:
+    """등록한 사람들을 세션에서 완전히 지우고, 이미 만들어 둔 결과를 새 설정으로 바로 다시 만들도록 표시한다.
+
+    ref_people(사진·벡터)에서 지우고 sync_ref_embs 가 ref_embs 를 다시 모아 처리에 쓰는 벡터에서도 빠진다(모두 해제하면 None).
+    처리해 둔 결과는 옛 설정(해제한 사람이 제외된 상태)으로 만든 것이라 함께 비우고, 적용을 눌렀던 종류는 다음 화면에서 자동으로 다시 처리한다
+    (render_result_card). 얼굴 클릭으로 올라간 사람(origin == "pick")은 얼굴 선택 칸의 선택 상태에서 다시 만들어지는데, 결과(= 선택 칸)를 비우므로
+    다시 등록되지 않는다.
     """
     people = st.session_state["ref_people"]
-    matched = cand_key if cand_key in people else find_registered_person(embs)
-    if matched is not None:
-        del people[matched]
-    else:
-        people[cand_key] = {"embs": embs, "thumb": cv2.cvtColor(thumb_bgr, cv2.COLOR_BGR2RGB)}
+    removed = False
+    for key in keys:
+        removed = people.pop(key, None) is not None or removed
+        st.session_state.get("pick_failed", set()).discard(key)
     st.session_state["keep_question"] = False    # 직접 등록·해제하고 있으니 더 묻지 않는다
+    sync_ref_embs()
+    if not removed:
+        return
+    apply_keys = st.session_state["auto_apply"]
+    if st.session_state["image_results"]:    # 사진: 얼굴 선택 칸이 새로 그려져 해제한 사람의 얼굴이 다시 가려진다
+        st.session_state["image_results"] = {}
+        apply_keys.add("run_image")
+    if st.session_state["video_result"] is not None:    # 영상: 얼굴부터 다시 찾아야 한다 (편집 상태도 옛 설정이다)
+        st.session_state["video_result"] = None
+        st.session_state["video_edit"] = None
+        apply_keys.add("run_video")
+
+
+def toggle_candidate(cand_key: tuple, embs: np.ndarray, thumb_bgr: np.ndarray) -> None:
+    """후보의 '등록' 태그 버튼 콜백. 꺼져 있으면 이 사람을 등록하고(켜짐), 이미 등록된 사람이면 그 사람을 해제한다(꺼짐).
+
+    이미 등록된 사람인지는 후보 번호가 아니라 얼굴이 닮았는지(find_registered_people)로 본다. 그래서 '유지'한 사람이 새 파일의 후보에서도
+    '✓ 등록됨'으로 보이고, 눌러서 해제할 수 있다. 해제는 그 사람으로 올라간 등록을 모두 지운다(얼굴 클릭 등록으로 따로 올라간 같은 사람 포함).
+    하나만 지우면 남은 쪽이 계속 '등록됨'으로 보이고 제외도 됐다. 사람마다 따로 켜고 끌 수 있어서 여러 명을 등록할 수 있다.
+    """
+    people = st.session_state["ref_people"]
+    matched = ([cand_key] if cand_key in people else []) + [key for key in find_registered_people(embs) if key != cand_key]
+    if matched:
+        release_people(matched)
+        return
+    people[cand_key] = {"embs": embs, "thumb": cv2.cvtColor(thumb_bgr, cv2.COLOR_BGR2RGB)}
+    st.session_state["keep_question"] = False
     sync_ref_embs()
 
 
 def clear_registration() -> None:
     """'등록 해제' 버튼의 콜백. 등록한 사람을 모두 지운다."""
-    st.session_state["ref_people"] = {}
+    release_people(list(st.session_state["ref_people"]))
     st.session_state["keep_question"] = False    # 지울 인물이 없으면 물을 것도 없다
-    sync_ref_embs()
 
 
 def reset_file_state() -> None:
@@ -2843,6 +3309,7 @@ def reset_file_state() -> None:
     st.session_state["image_results"] = {}
     st.session_state["video_result"] = None
     st.session_state["video_edit"] = None
+    st.session_state["auto_apply"] = set()    # 새 파일은 사용자가 적용을 눌러야 처음 처리한다 (이전 파일의 자동 재처리 표시는 버린다)
 
 
 def answer_keep_people() -> None:
@@ -3014,6 +3481,7 @@ def main() -> None:
     page_main_demo()
     render_bottom_bar()
     inject_paging_script()
+    inject_modal_script()
     inject_scroll_script()
 
 
