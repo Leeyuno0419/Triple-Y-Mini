@@ -34,6 +34,8 @@ from src.config import (
     DET_THRESH,
     EMBED_MAX_TURN,
     EXCLUDE_GRACE_FRAMES,
+    GROUP_MARGIN,
+    GROUP_MIN_FACES,
     JUDGE_CANVAS_SCALE,
     JUDGE_MAX_TURN,
     JUDGE_RETRY_FRAMES,
@@ -43,6 +45,7 @@ from src.config import (
     PAD,
     RECHECK_FRAMES,
     REF_MAX_EMBS,
+    SIM_GROUP_LOW,
     SIM_THRESHOLD,
     SIM_UNSURE_LOW,
 )
@@ -360,6 +363,7 @@ def filter_excluded(
       4. 캐시에 없으면 판정하고, track_id 가 있으면 결과를 캐시에 저장한다. 제외로 확정된 track 이 고개를 돌려 다시 판정이 미뤄지면
          마지막 확실한 판정 뒤 EXCLUDE_GRACE_FRAMES 프레임까지는 제외를 유지한다. 처음 보는 track 의 첫 '다른 사람' 판정은
          옆얼굴처럼 미루고, 두 번째 '다른 사람' 판정에서 확정한다(제외 기준 threshold 는 그대로라 다른 사람이 제외될 위험은 늘지 않는다).
+      5. (사진 전용, cache 가 없을 때) 위 판정이 끝난 뒤, 단체 사진에서 threshold 바로 아래로 놓친 등록 인물을 같은 사진의 다른 얼굴과 비교해 구한다. _group_rescue 를 보라.
     판정: 박스를 여백(PAD)과 함께 잘라 얼굴 벡터를 구하고, ref_embs 와의 코사인 유사도 최댓값이 threshold 이상이면 제외.
     잘라낸 곳에서 얼굴을 못 찾거나 벡터를 못 만들면 제외하지 않는다(모자이크 유지). 이런 '판정 불가'는 캐시에 저장하지 않아
     다음 프레임에 다시 시도한다.
@@ -374,6 +378,7 @@ def filter_excluded(
 
     get_face_app()    # 모델이 없으면(ImportError) 여기서 바로 알린다. 아래 판정 중의 오류는 '모자이크 유지'로 처리한다
     kept: list[Box] = []
+    evidence: dict[int, dict] = {}    # 사진 모드: 박스 번호 -> {"emb", "turn", "excluded"} (단체 사진 구제용)
     for i, box in enumerate(boxes):
         x1, y1, x2, y2 = box["xyxy"]
         track_id = box.get("track_id")
@@ -394,7 +399,11 @@ def filter_excluded(
 
         excluded = _cached_verdict(cache, track_id, frame_no)         # 3. 캐시
         if excluded is None:                                          # 4. 새로 판정
-            excluded, turned = _judge_face(img, box, ref, threshold)
+            trace: Optional[dict] = {} if cache is None else None     # 사진이면 판정에 쓴 얼굴 벡터를 모아 두었다가 아래에서 단체 사진 구제에 쓴다
+            excluded, turned = _judge_face(img, box, ref, threshold, trace)
+            if trace:
+                trace["excluded"] = excluded is True
+                evidence[i] = trace
             if cache is not None and track_id is not None:
                 prev = cache.get(track_id)
                 # 처음 보는(또는 판정을 미뤄 둔) track 의 첫 '다른 사람' 판정은 흐린 프레임 한 장일 수 있어 미루고, 두 번째에 확정한다
@@ -420,7 +429,43 @@ def filter_excluded(
                     cache[track_id]["neg1"] = True                    # 다음 '다른 사람' 판정은 바로 확정한다
         if excluded is not True:                                      # 제외로 확정된 것만 뺀다
             kept.append(box)
+    rescued = _group_rescue(evidence, ref, threshold)                 # 5. 단체 사진(사진 모드)에서 기준 바로 아래로 놓친 등록 인물을 구한다
+    if rescued:
+        saved = [boxes[i] for i in rescued]
+        kept = [b for b in kept if not any(b is s for s in saved)]
     return kept
+
+
+def _group_rescue(evidence: dict[int, dict], ref: np.ndarray, threshold: float) -> set[int]:
+    """사진 한 장에서 SIM_THRESHOLD 에 못 미쳐 모자이크된 얼굴 중 등록 인물로 볼 만한 것의 박스 번호를 돌려준다. 없으면 빈 집합.
+
+    한 사진 안의 서로 다른 얼굴은 확실히 다른 사람이다. 등록 인물이 사진 속에 있다면 그 얼굴만 등록 벡터와 뚜렷하게 닮고, 나머지 얼굴은 훨씬 덜 닮는다.
+    그래서 아래를 모두 만족하는 얼굴만 구한다(제외로 바꾼다). 기준을 사진 전체에 낮추는 것이 아니라 '다른 얼굴과 비교해 뚜렷할 때'로 좁힌 규칙이다.
+      1. 사진에서 판정한 얼굴이 GROUP_MIN_FACES 개 이상이다. (비교할 다른 얼굴이 모자라면 기준을 낮추지 않는다)
+      2. 등록 벡터와의 유사도 최댓값이 SIM_GROUP_LOW 이상 threshold 미만이다. (이미 제외된 얼굴과 너무 낮은 얼굴은 건드리지 않는다)
+      3. 정면에 가깝다. (JUDGE_MAX_TURN 이내. 옆얼굴의 유사도는 믿기 어렵다)
+      4. 가장 닮은 등록 벡터를 기준으로, 사진의 다른 모든 얼굴(이미 제외된 얼굴 포함)보다 GROUP_MARGIN 이상 더 닮았다.
+         다른 얼굴이 이미 그 벡터와 닮아 제외됐다면 그쪽이 본인이므로 구하지 않는다.
+    영상·실시간(cache 가 있는 경우)은 evidence 가 비어 있어 이 규칙을 쓰지 않는다.
+    """
+    if len(evidence) < GROUP_MIN_FACES:
+        return set()
+    rescued: set[int] = set()
+    for i, ev in evidence.items():
+        if ev["excluded"]:
+            continue
+        sims = ref @ ev["emb"]
+        best = float(np.max(sims))
+        if not SIM_GROUP_LOW <= best < threshold:
+            continue
+        turn = ev["turn"]
+        if turn is not None and abs(turn) > JUDGE_MAX_TURN:
+            continue
+        vec = ref[int(np.argmax(sims))]
+        others = max(float(vec @ other["emb"]) for j, other in evidence.items() if j != i)
+        if best - others >= GROUP_MARGIN:
+            rescued.add(i)
+    return rescued
 
 
 def _overlaps_other(box: Box, boxes: list[Box], index: int) -> bool:
@@ -477,7 +522,7 @@ def _on_canvas(crop: np.ndarray) -> np.ndarray:
     return canvas
 
 
-def _judge_face(img: np.ndarray, box: Box, ref: np.ndarray, threshold: float) -> tuple[Optional[bool], bool]:
+def _judge_face(img: np.ndarray, box: Box, ref: np.ndarray, threshold: float, trace: Optional[dict] = None) -> tuple[Optional[bool], bool]:
     """박스 안의 얼굴이 등록 인물인지 판정한다. (판정, 옆얼굴이라 미룸)을 돌려준다.
 
     판정: 등록 인물이면 True, 아니면 False, 판단할 수 없으면 None.
@@ -505,9 +550,11 @@ def _judge_face(img: np.ndarray, box: Box, ref: np.ndarray, threshold: float) ->
         if emb is None:
             return None, False
         sim = float(np.max(ref @ emb))
+        turn = _face_turn(face)
+        if trace is not None:                         # 사진 모드: 단체 사진 구제(_group_rescue)가 쓰도록 얼굴 벡터와 돌아간 정도를 넘겨 준다
+            trace["emb"], trace["turn"] = emb, turn
         if sim >= threshold:
             return True, False
-        turn = _face_turn(face)
         if turn is not None and abs(turn) > JUDGE_MAX_TURN:
             return None, True                         # 옆얼굴: 낮은 유사도를 믿을 수 없다 -> 모자이크는 유지하되 나중에 다시 본다
         if sim >= SIM_UNSURE_LOW:
