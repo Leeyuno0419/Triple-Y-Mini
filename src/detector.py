@@ -13,32 +13,42 @@ from ultralytics import YOLO
 from ultralytics.trackers.byte_tracker import BYTETracker
 from ultralytics.utils import IterableSimpleNamespace
 
-from src.config import CONF, TRACKER, WEIGHTS
+from src.config import CONF, TRACKER, WEIGHTS, WEIGHTS_PHOTO, WEIGHTS_VIDEO
 from src.types import Box
 
-_WEIGHTS_PATH = str(Path(__file__).resolve().parent.parent / WEIGHTS)  # 실행 폴더와 무관하게 루트 기준
-
-_model = YOLO(_WEIGHTS_PATH)  # import 시 한 번만 로드
+_ROOT = Path(__file__).resolve().parent.parent  # 실행 폴더와 무관하게 루트 기준
+# 모드별 가중치: 사진은 정확도 우선(m), 영상 파일은 균형(s), 실시간은 입력 속도를 따라가야 해서 가장 작은 n (모델비교.md)
+_WEIGHTS_BY_MODE = {"photo": WEIGHTS_PHOTO, "video": WEIGHTS_VIDEO, "stream": WEIGHTS}
+_models: dict[str, YOLO] = {}  # 모드별로 처음 쓸 때 한 번만 로드
 # model.track()은 track을 못 받은 탐지(새로 나타난 얼굴 등)를 결과에서 빼서 그 얼굴이 노출된다.
 # 추적기를 직접 돌려 모든 탐지를 돌려주고, track이 붙은 것에만 track_id를 단다.
 _tracker = BYTETracker(IterableSimpleNamespace(**TRACKER))
 
 
-def detect_faces(img: np.ndarray, track: bool = False) -> list[Box]:
+def _get_model(mode: str) -> YOLO:
+    """mode("photo"·"video"·"stream")에 맞는 YOLO 모델을 돌려준다. 처음 부를 때만 가중치를 읽는다."""
+    if mode not in _models:
+        _models[mode] = YOLO(str(_ROOT / _WEIGHTS_BY_MODE[mode]))
+    return _models[mode]
+
+
+def detect_faces(img: np.ndarray, track: bool = False, mode: str = "photo") -> list[Box]:
     """BGR 이미지에서 얼굴을 찾아 박스 목록을 돌려준다. 얼굴이 없으면 [].
 
+    mode는 "photo"(사진, YOLO11m), "video"(영상 파일, YOLO11s), "stream"(실시간, YOLO11n) 중 하나로 쓸 모델을 고른다.
     track=True면 ByteTrack으로 프레임 간 같은 사람에 track_id를 붙인다 (영상·실시간용).
     점수가 CONF 이상인 탐지는 track을 못 받아도 track_id=None으로 돌려준다 (모자이크 누락 방지).
     CONF 미만 탐지는 기존 track에 이어 붙었을 때만 돌려준다.
     좌표는 바깥쪽으로 반올림(x1·y1 내림, x2·y2 올림)해 이미지 범위로 자르고, 크기가 0인 박스는 버린다.
     """
+    model = _get_model(mode)
     if track:
-        result = _model(img, conf=TRACKER["track_low_thresh"], verbose=False)[0]  # 2단계 매칭용 약한 탐지까지
+        result = model(img, conf=TRACKER["track_low_thresh"], verbose=False)[0]  # 2단계 매칭용 약한 탐지까지
         tracks = _tracker.update(result.boxes.cpu().numpy(), img)
         id_by_idx = {int(t[7]): int(t[4]) for t in tracks}  # t = [x1, y1, x2, y2, track_id, score, cls, idx]
         ids = [id_by_idx.get(i) for i in range(len(result.boxes))]
     else:
-        result = _model(img, conf=CONF, verbose=False)[0]
+        result = model(img, conf=CONF, verbose=False)[0]
         ids = [None] * len(result.boxes)
 
     img_h, img_w = img.shape[:2]

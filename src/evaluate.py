@@ -122,7 +122,7 @@ def benchmark_fps(
 
     det_fps는 weights 모델을 직접 불러 imgsz로 탐지만 잰다 (처음 몇 프레임은 워밍업으로 뺌).
     pipeline_fps·exclude_fps는 B의 process_video가 돌려주는 fps이며, process_video는
-    config.WEIGHTS 모델을 쓰므로 weights·imgsz 인자가 반영되지 않는다.
+    config.WEIGHTS_VIDEO 모델을 쓰므로 weights·imgsz 인자가 반영되지 않는다.
     B의 video.py가 없으면 pipeline_fps, C의 exclude.py가 없거나 ref_embs가 None이면 exclude_fps가 None이다.
     """
     cap = cv2.VideoCapture(video_path)

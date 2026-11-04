@@ -476,7 +476,7 @@ def process_video_edit(
                 id_offset = max_track_id
                 cut_frames.add(len(per_frame))
 
-            boxes = detect_faces(frame, track=True)
+            boxes = detect_faces(frame, track=True, mode="video")
             for box in boxes:
                 if box["track_id"] is not None:
                     box["track_id"] += id_offset    # 추적기를 비우면 번호가 1 부터 다시 매겨지니 영상 전체에서 겹치지 않게 이어 붙인다
