@@ -1564,7 +1564,7 @@ def process_video_demo(
                 writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
                 if not writer.isOpened():
                     raise RuntimeError("결과 영상을 저장할 수 없습니다.")
-            detected = detect_faces(frame, track=True)
+            detected = detect_faces(frame, track=True, mode="video")
             boxes = filter_excluded(frame, detected, ref_embs, cache=cache) if filter_excluded else list(detected)
             present = {b.get("track_id") for b in detected}
             for b in boxes:

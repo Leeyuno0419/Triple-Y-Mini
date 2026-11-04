@@ -470,7 +470,7 @@ def process_stream(
                     )
                 else:
                     detect_frame = frame
-                boxes = detect_faces(detect_frame, track=True)
+                boxes = detect_faces(detect_frame, track=True, mode="stream")
                 if scale < 1.0:
                     inv_scale = 1.0 / scale
                     boxes = [

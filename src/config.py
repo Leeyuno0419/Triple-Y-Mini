@@ -1,6 +1,8 @@
 """공통 설정. 숫자는 이 파일에서만 바꾼다 (역할별_구현명세.md 0장)."""
 
-WEIGHTS = "weights/best.pt"   # A가 교체 (프로젝트 루트 기준 경로)
+WEIGHTS = "weights/best.pt"   # 실시간용 탐지 가중치(YOLO11n-face). A가 교체 (프로젝트 루트 기준 경로)
+WEIGHTS_VIDEO = "weights/yolov11s-face.pt"  # 영상 파일용 (YOLO11s-face). WIDER val 200장에서 오탐 수를 맞춘 누락률 n 16.9% -> s 13.3%, CPU 시간 약 2배 (11-03, 모델비교.md)
+WEIGHTS_PHOTO = "weights/yolov11m-face.pt"  # 사진용 (YOLO11m-face). 같은 기준 누락률 11.2%, 한 장이라 시간 부담이 적다 (11-03, 모델비교.md)
 CONF = 0.15                   # 탐지 임계값. 0.25 -> 0.15: WIDER val 200장 누락률 19.0% -> 16.9%, FPS 같음, 오탐 증가 (11-02 결정, 진행현황 11)
 PAD = 0.15                    # 박스 여백 비율
 BLOCKS = 6                    # 얼굴 긴 변을 몇 칸으로 나눌지 (모자이크 강도)
